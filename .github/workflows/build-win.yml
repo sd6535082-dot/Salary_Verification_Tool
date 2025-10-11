@@ -1,0 +1,37 @@
+name: Build Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']   # 打 tag 自动出包；也可以去掉这段只保留手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install pandas numpy openpyxl XlsxWriter pyinstaller
+      - name: Build CLI exe
+        run: |
+          pyinstaller --onefile --clean ^
+            --name soe_validator ^
+            --collect-all pandas --collect-all numpy --collect-all openpyxl --collect-all XlsxWriter ^
+            soe_validator_v22_full_v2_fixed.py
+      # 如需 GUI，一并打包（调用 CLI 或内嵌逻辑均可）
+      - name: Build GUI exe (optional)
+        if: ${{ hashFiles('soe_validator_gui_win.py') != '' }}
+        run: |
+          pyinstaller --noconsole --onedir --clean --name SOE校验器 soe_validator_gui_win.py
+          copy dist\soe_validator.exe dist\SOE校验器\
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: |
+            dist/soe_validator.exe
+            dist/SOE校验器/**
