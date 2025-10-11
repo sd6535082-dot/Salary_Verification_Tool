@@ -40,15 +40,7 @@ jobs:
           if (Test-Path "soe_validator_gui_win.py") { Write-Host "GUI script found." }
 
       - name: Build CLI exe
-        shell: pwsh
-        run: |
-          pyinstaller --onefile --clean `
-            --name soe_validator `
-            --collect-all pandas `
-            --collect-all numpy `
-            --collect-all openpyxl `
-            --collect-all XlsxWriter `
-            soe_validator_v22_full_v2_fixed.py
+        run: pyinstaller --onefile --clean --name soe_validator --collect-all pandas --collect-all numpy --collect-all openpyxl --collect-all XlsxWriter soe_validator_v22_full_v2_fixed.py
 
       # 可选：GUI（onedir），并把 CLI exe 复制进去，GUI 调用它
       - name: Build GUI exe (optional)
