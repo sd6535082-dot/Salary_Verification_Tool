@@ -1,37 +1,71 @@
 name: Build Windows EXE
+
 on:
-  workflow_dispatch:
-  push:
-    tags: ['v*']   # 打 tag 自动出包；也可以去掉这段只保留手动触发
+  workflow_dispatch: {}
+  # 如需打 tag 自动出包，取消下面两行注释
+  # push:
+  #   tags: ['v*']
 
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Show env
+        shell: pwsh
+        run: |
+          python -V
+          pip -V
+          ls
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install deps
+        shell: pwsh
         run: |
           python -m pip install -U pip
           pip install pandas numpy openpyxl XlsxWriter pyinstaller
-      - name: Build CLI exe
+
+      # 确保脚本文件在仓库根目录（或把路径改成实际位置）
+      - name: Verify files exist
+        shell: pwsh
         run: |
-          pyinstaller --onefile --clean ^
-            --name soe_validator ^
-            --collect-all pandas --collect-all numpy --collect-all openpyxl --collect-all XlsxWriter ^
+          dir
+          if (!(Test-Path "soe_validator_v22_full_v2_fixed.py")) { throw "Missing soe_validator_v22_full_v2_fixed.py" }
+          # GUI 可选：存在就一起打
+          if (Test-Path "soe_validator_gui_win.py") { Write-Host "GUI script found." }
+
+      - name: Build CLI exe
+        shell: pwsh
+        run: |
+          pyinstaller --version
+          pyinstaller --onefile --clean `
+            --name soe_validator `
+            --collect-all pandas `
+            --collect-all numpy `
+            --collect-all openpyxl `
+            --collect-all XlsxWriter `
             soe_validator_v22_full_v2_fixed.py
-      # 如需 GUI，一并打包（调用 CLI 或内嵌逻辑均可）
+
+      # 可选：GUI（onedir），并把 CLI exe 复制进去，GUI 调用它
       - name: Build GUI exe (optional)
         if: ${{ hashFiles('soe_validator_gui_win.py') != '' }}
+        shell: pwsh
         run: |
-          pyinstaller --noconsole --onedir --clean --name SOE校验器 soe_validator_gui_win.py
-          copy dist\soe_validator.exe dist\SOE校验器\
+          pyinstaller --noconsole --onedir --clean `
+            --name SOE_GUI `
+            soe_validator_gui_win.py
+          Copy-Item -Force dist\soe_validator.exe dist\SOE_GUI\
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
           path: |
             dist/soe_validator.exe
-            dist/SOE校验器/**
+            dist/SOE_GUI/**
+          if-no-files-found: warn
