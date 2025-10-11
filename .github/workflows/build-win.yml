@@ -42,7 +42,6 @@ jobs:
       - name: Build CLI exe
         shell: pwsh
         run: |
-          pyinstaller --version
           pyinstaller --onefile --clean `
             --name soe_validator `
             --collect-all pandas `
