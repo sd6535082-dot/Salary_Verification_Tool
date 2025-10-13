@@ -1,726 +1,483 @@
 # -*- coding: utf-8 -*-
 """
-SOE Validator (v2.2 full v2) — 表内 + 表间
-新增：控制“主数据重复”提示的输出位置
-    --master-dup-report {inline,summary,off}  默认为 summary
-
-python soe_validator_v22_full_v2_fixed.py \
-  --data "/Users/rainmor1990/Desktop/2.0基础校验/待校验数据.xlsx" \
-  --rules-xlsx "/Users/rainmor1990/Desktop/2.0基础校验/数据标准2.0数据采集校验规则_V2.2.xlsx" \
-  --sheet "央企端-表内校验"\
-  --codes-sheet "码值表" \
-  --tables "中央企业各级次单位信息情况表" "中央企业职工收入情况表" "中央企业各级单位人工成本情况表" "中央企业职工中长期激励情况表-奖励现金型" "中央企业职工中长期激励情况表-奖励股权型" "中央企业职工中长期激励情况表-出售股权型" "中央企业农民工情况表" "中央企业各级负责人年度薪酬情况表" \
-  --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" \
-  --length-mode max \
-  --master-dup-report off \
-  --output "/Users/rainmor1990/Desktop/2.0基础校验/validation_errors_v22.xlsx"
-
-
+soe_validator_v22_full_v2_fixed.py
+V2.2 最终整合版（修复人工成本合计漏项：支持“非货币性福利”与“技术奖酬金及业*设计奖”别名；
+表内+表间；空表容错；字段级“长度=”；Sheet 名去重；忽略字段名不一致）
 """
 
 import argparse
+from decimal import Decimal, ROUND_HALF_UP
 import json
-import re
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+import math
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional, DefaultDict, Set
-from collections import defaultdict
+import re
+import sys
+import warnings
 
 import pandas as pd
 
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# -----------------------------
-# 规则编译（从 Excel -> JSON）
-# -----------------------------
+EXPECTED_TABLES = [
+    "中央企业各级次单位信息情况表",
+    "中央企业职工收入情况表",
+    "中央企业职工中长期激励情况表-奖励现金型",
+    "中央企业职工中长期激励情况表-奖励股权型",
+    "中央企业职工中长期激励情况表-出售股权型",
+    "中央企业各级单位人工成本情况表",
+    "中央企业农民工情况表",
+    "中央企业各级负责人年度薪酬情况表",
+]
 
-COL_ALIASES = {
-    "table": ["表名", "所属表", "表中文名", "表"],
-    "field": ["字段", "字段名", "列名", "字段中文名"],
-    "required": ["是否必填", "必填", "必填项"],
-    "type": ["类型", "数据类型", "字段类型"],
-    "max_len": ["最大长度", "长度上限", "字段长度", "长度"],
-    "exact_len": ["固定长度", "长度等于"],
-    "int_len": ["整数位", "整数长度"],
-    "dec_len": ["小数位", "小数长度", "精度"],
-    "charset": ["字符集", "正则", "允许字符", "字符规则", "字符约束", "pattern"],
-    "enum": ["枚举", "枚举值", "下拉选项", "取值范围", "码值", "允许值", "字典项", "下拉值"],
-    "enum_ref": ["枚举编码", "字典编码", "码值编码", "数据字典编码"],
-}
+STRICT_HEADER_MATCH = False  # 按用户要求忽略“字段名与规则不一致”
 
-TRUE_SET = {"是", "Y", "y", "true", "True", "1", 1}
-NUM_TYPE_HINTS = {"number", "numeric", "decimal", "金额", "数值", "小数", "浮点", "float"}
-INT_TYPE_HINTS = {"int", "integer", "整数"}
-
-
-def _find_col(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    for a in aliases:
-        if a in df.columns:
-            return a
-    norm = {re.sub(r"\s+", "", c): c for c in df.columns}
-    for a in aliases:
-        key = re.sub(r"\s+", "", a)
-        if key in norm:
-            return norm[key]
-    return None
-
-
-def _coerce_bool(v) -> bool:
-    if pd.isna(v):
-        return False
-    s = str(v).strip()
-    return s in TRUE_SET
-
-
-def _coerce_int(v) -> Optional[int]:
-    if pd.isna(v) or str(v).strip() == "":
-        return None
+def to_decimal(x, places=2):
     try:
-        return int(float(v))
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return Decimal("0.00")
+        d = Decimal(str(x))
+        q = "0." + "0"*places
+        return d.quantize(Decimal(q), rounding=ROUND_HALF_UP)
     except Exception:
-        return None
+        return Decimal("0.00")
 
-
-def _coerce_type(v) -> Optional[str]:
-    if pd.isna(v):
-        return None
-    s = str(v).strip()
-    s_low = s.lower()
-    if s_low in INT_TYPE_HINTS:
-        return "int"
-    if s_low in NUM_TYPE_HINTS:
-        return "number"
-    return "string"
-
-
-def _split_enum_list(v: Any) -> List[str]:
-    if pd.isna(v):
-        return []
-    s = str(v).strip()
-    if not s:
-        return []
-    parts = re.split(r"[|、，,;\n\r]+", s)
-    return [p.strip() for p in parts if p.strip() != ""]
-
-
-def compile_rules_from_excel(xlsx_path: Path, sheet_name: str = "央企端-表内校验",
-                             codes_sheet: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
-    xls = pd.ExcelFile(xlsx_path)
-    if sheet_name not in xls.sheet_names:
-        raise ValueError(f"规则文件中未找到Sheet：{sheet_name}，可用：{xls.sheet_names}")
-
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
-
-    codebook: Dict[str, List[str]] = {}
-    if codes_sheet and codes_sheet in xls.sheet_names:
-        df_codes = pd.read_excel(xlsx_path, sheet_name=codes_sheet)
-        code_col = None
-        val_col = None
-        for c in df_codes.columns:
-            if any(k in str(c) for k in ["编码", "字典", "码值编码"]):
-                code_col = c
-            if any(k in str(c) for k in ["值", "名称", "取值", "内容"]):
-                if val_col is None:
-                    val_col = c
-        if code_col and val_col:
-            for k, grp in df_codes.groupby(code_col):
-                vals = [str(v).strip() for v in grp[val_col].tolist() if str(v).strip() != ""]
-                if vals:
-                    codebook[str(k).strip()] = vals
-
-    col_table   = _find_col(df, COL_ALIASES["table"])
-    col_field   = _find_col(df, COL_ALIASES["field"])
-    col_req     = _find_col(df, COL_ALIASES["required"])
-    col_type    = _find_col(df, COL_ALIASES["type"])
-    col_max_len = _find_col(df, COL_ALIASES["max_len"])
-    col_exact   = _find_col(df, COL_ALIASES["exact_len"])
-    col_int     = _find_col(df, COL_ALIASES["int_len"])
-    col_dec     = _find_col(df, COL_ALIASES["dec_len"])
-    col_charset = _find_col(df, COL_ALIASES["charset"])
-    col_enum    = _find_col(df, COL_ALIASES["enum"])
-    col_enumref = _find_col(df, COL_ALIASES["enum_ref"])
-
-    if any(c is None for c in [col_table, col_field]):
-        raise ValueError("规则表缺少必要列：表名/字段名")
-
-    compiled: Dict[str, Dict[str, Any]] = {}
-    for _, r in df.iterrows():
-        table = str(r[col_table]).strip()
-        field = str(r[col_field]).strip()
-        if not table or not field or table == "nan" or field == "nan":
-            continue
-        tr = compiled.setdefault(table, {}).setdefault(field, {})
-
-        if col_req:     tr["required"] = _coerce_bool(r[col_req])
-        if col_type:    tr["type"] = _coerce_type(r[col_type])
-        if col_max_len:
-            ml = _coerce_int(r[col_max_len]);    tr["max_len"] = ml if ml is not None else tr.get("max_len")
-        if col_exact:
-            el = _coerce_int(r[col_exact]);      tr["exact_len"] = el if el is not None else tr.get("exact_len")
-        if col_int:
-            il = _coerce_int(r[col_int]);        tr["int_len"] = il if il is not None else tr.get("int_len")
-        if col_dec:
-            dl = _coerce_int(r[col_dec]);        tr["dec_len"] = dl if dl is not None else tr.get("dec_len")
-        if col_charset:
-            cs = r[col_charset];                  tr["allowed_charset"] = cs.strip() if isinstance(cs, str) and cs.strip() else tr.get("allowed_charset")
-
-        values: List[str] = []
-        if col_enum and not pd.isna(r[col_enum]):
-            values.extend(_split_enum_list(r[col_enum]))
-        if col_enumref and isinstance(r[col_enumref], str) and r[col_enumref].strip():
-            ref = r[col_enumref].strip()
-            values.extend(codebook.get(ref, []))
-        if values:
-            tr["dropdown"] = {"values": sorted(list(dict.fromkeys(values)))}
-
-    return compiled
-
-
-# -----------------------------
-# 通用工具
-# -----------------------------
-
-def excel_like_str(val) -> str:
-    if pd.isna(val):
-        return ""
-    return str(val)
-
-def to_decimal(val, places: int = 2) -> Optional[Decimal]:
-    if pd.isna(val) or val == "":
-        return None
-    try:
-        d = Decimal(str(val))
-        q = Decimal(10) ** -places
-        return d.quantize(q, rounding=ROUND_HALF_UP)
-    except (InvalidOperation, ValueError):
-        return None
-
-def count_decimal_places(d: Decimal) -> int:
-    s = format(d, 'f')
-    return len(s.split('.')[-1]) if '.' in s else 0
-
-def sheet_loader(data_path: Path, table_names: List[str]) -> Dict[str, pd.DataFrame]:
-    frames = {}
-    if data_path.is_dir():
-        for t in table_names:
-            candidates = [
-                data_path / f"{t}.xlsx",
-                data_path / f"{t}.xls",
-                data_path / f"{t}.xlsm",
-            ]
-            normalized = re.sub(r'[^\w\u4e00-\u9fff]+', '', t)
-            candidates += [
-                data_path / f"{normalized}.xlsx",
-                data_path / f"{normalized}.xls",
-            ]
-            file = None
-            for c in candidates:
-                if c.exists():
-                    file = c
-                    break
-            if file is None:
-                raise FileNotFoundError(f"目录 {data_path} 未找到与表名匹配的文件：{t}.xlsx")
-            frames[t] = pd.read_excel(file)
+def read_data_any(path: Path) -> dict:
+    data = {}
+    if path.is_file():
+        xls = pd.ExcelFile(path)
+        for sn in xls.sheet_names:
+            data[sn] = xls.parse(sn)
+    elif path.is_dir():
+        for t in EXPECTED_TABLES:
+            candidates = sorted(list(path.glob(f"{t}.xlsx"))) or sorted(list(path.glob(f"{t}*.xlsx")))
+            if candidates:
+                df = pd.read_excel(candidates[0])
+                data[t] = df
+            else:
+                data[t] = pd.DataFrame()
     else:
-        xls = pd.ExcelFile(data_path)
-        for t in table_names:
-            if t not in xls.sheet_names:
-                raise ValueError(f"工作簿 {data_path} 未包含工作表：{t}")
-            frames[t] = pd.read_excel(data_path, sheet_name=t)
-    return frames
+        raise FileNotFoundError(f"未找到数据路径：{path}")
+    for t in EXPECTED_TABLES:
+        data.setdefault(t, pd.DataFrame())
+    return data
 
+def compile_rules_from_excel(xlsx_path: Path, sheet_name="央企端-表内校验", codes_sheet="码值表") -> dict:
+    rules = {t: [] for t in EXPECTED_TABLES}
+    if not xlsx_path.exists():
+        return rules
+    try:
+        df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+    except Exception:
+        return rules
 
-def validate_listing_type(value: str) -> Tuple[bool, str]:
-    if value is None:
-        return False, "不能为空"
-    s = str(value).strip()
-    if s == "":
-        return False, "不能为空"
-    if not re.fullmatch(r'^[a-i](\|[a-i])*$', s):
-        return False, "仅允许字母a~i，使用“|”分隔（如 a|b|c 或 i）"
-    parts = s.split('|')
-    if len(parts) != len(set(parts)):
-        return False, "不允许重复值（如 a|a）"
-    if 'i' in parts and len(parts) > 1:
-        return False, "当选择 i(非上市) 时不能与其他值并存"
-    return True, ""
+    def find_col(*keys):
+        for k in keys:
+            for c in df.columns:
+                if re.search(k, str(c), re.I):
+                    return c
+        return None
 
+    col_tab = find_col("表名|表格|表中文名")
+    col_field = find_col("字段|列名|字段名称")
+    col_req = find_col("必填|是否必填")
+    col_len = find_col("长度|字长|最大长度")
+    col_dec = find_col("小数|精度")
+    col_enum = find_col("枚举|码值|取值|选项")
+    col_rule = find_col("规则|说明|校验")
+    if col_tab is None or col_field is None:
+        return rules
 
-def coerce_required(val) -> bool:
-    if pd.isna(val):
-        return False
-    if isinstance(val, str) and val.strip() == "":
-        return False
-    return True
+    for _, r in df.iterrows():
+        t = str(r.get(col_tab, "")).strip()
+        f = str(r.get(col_field, "")).strip()
+        if not t or not f or t not in rules:
+            continue
+        it = {"field": f}
+        req = str(r.get(col_req, "")).strip()
+        it["required"] = True if req in ("是", "必填", "Y", "1", "yes", "Yes") else False
+        ml = r.get(col_len, None)
+        try:
+            it["max_len"] = int(ml) if pd.notnull(ml) else None
+        except Exception:
+            it["max_len"] = None
+        dc = r.get(col_dec, None)
+        try:
+            it["decimals"] = int(dc) if pd.notnull(dc) else None
+        except Exception:
+            it["decimals"] = None
+        ev = r.get(col_enum, None)
+        if pd.notnull(ev):
+            s = str(ev).strip().replace("；",";").replace("，",",").replace("/", "|").replace("\\","|")
+            parts = re.split(r"[|;,，；\s]+", s)
+            it["enum"] = set([p for p in parts if p])
+        else:
+            it["enum"] = None
 
+        it["raw_rule"] = str(r.get(col_rule, "")).strip() if pd.notnull(r.get(col_rule, "")) else ""
 
-def build_pk(row: pd.Series, df_cols: List[str], user_pk: List[str]) -> str:
-    parts = []
-    for c in user_pk:
-        if c in df_cols and not pd.isna(row.get(c, None)):
-            parts.append(f"{c}={row.get(c)}")
-    if parts:
-        return " | ".join(parts)
-    auto_cols = ["统一社会信用代码", "子企业统一社会信用代码", "证件号码", "姓名", "子企业单位名称", "所属上级企业名称", "单位名称"]
-    for c in auto_cols:
-        if c in df_cols and not pd.isna(row.get(c, None)):
-            parts.append(f"{c}={row.get(c)}")
-    return " | ".join(parts)
+        # 从规则文本自动识别“长度等于”的语义（避免把“最长不超过”误判为等于）
+        it["len_equals"] = False
+        rr = str(it.get("raw_rule","") or "")
+        rr_norm = rr.replace(" ", "")
+        negative_tokens = ("不超过","最多","至多","不大于","≤","小于等于","不高于","以内","以下","不多于","不超")
+        positive_tokens = ("长度等于","必须等于","固定长度","长度应等于","严格等于")
+        if it.get("max_len"):
+            if not any(tok in rr_norm for tok in negative_tokens):
+                if any(tok in rr_norm for tok in positive_tokens) or re.search(r"(长度|字长|字符数)\s*[:=：]\s*\d+\s*(位|字符|字)?(?!以内|以下|不超过)", rr):
+                    it["len_equals"] = True
 
+        # 字段级覆盖：这些名称按“≤最大长度”处理
+        MAX_ONLY_FIELDS = {"集团注册名称","子企业单位名称","企业简称","所属上级企业名称"}
+        if it.get("field") in MAX_ONLY_FIELDS:
+            it["len_equals"] = False
 
-# -----------------------------
-# 表内校验
-# -----------------------------
+        # 特例：发薪时间固定19位
+        if it["field"] == "发薪时间":
+            if not it.get("max_len"):
+                it["max_len"] = 19
+            it["len_equals"] = True
 
-def validate_dataframe(df: pd.DataFrame,
-                       table: str,
-                       rules: Dict[str, Any],
-                       length_mode: str,
-                       pk_map: Dict[str, List[str]]) -> Tuple[List[Dict[str, Any]], pd.DataFrame]:
-    errors: List[Dict[str, Any]] = []
-    annotated_msgs: DefaultDict[int, List[str]] = defaultdict(list)
+        rules[t].append(it)
 
-    rule_fields = list(rules.keys())
-    missing_cols = [c for c in rule_fields if c not in df.columns]
-    extra_cols   = [c for c in df.columns if c not in rule_fields]
+    return rules
 
-    if missing_cols or extra_cols:
-        errors.append({
-            "表名": table, "行号": "", "主键": "",
-            "字段": ",".join(missing_cols) if missing_cols else "",
-            "错误类型": "字段不匹配",
-            "错误信息": f"缺少字段：{missing_cols}; 多余字段：{extra_cols}",
-            "建议修复": "请使用最新模板/确保列名与规则完全一致",
-            "原始值": ""
-        })
+def build_pk_value(row: pd.Series, pk_fields: list) -> str:
+    if not pk_fields:
+        return ""
+    vals = []
+    for c in pk_fields:
+        vals.append(str(row.get(c, "")).strip())
+    return "|".join(vals)
 
-    for idx, row in df.iterrows():
-        pk = build_pk(row, df.columns.tolist(), pk_map.get(table, []))
+def validate_dataframe(df: pd.DataFrame, table: str, rules: dict, length_mode="max", pk_map=None):
+    errors = []
+    adf = (df.copy() if df is not None else pd.DataFrame())
+    if "__校验错误__" not in adf.columns:
+        adf["__校验错误__"] = ""
+    if df is None or df.empty:
+        return errors, adf
 
-        for field, rule in rules.items():
-            if field not in df.columns:
-                continue
+    table_rules = rules.get(table, []) if isinstance(rules, dict) else (rules or [])
+    pk_fields = []
+    if pk_map and table in pk_map:
+        pk_fields = [x.strip() for x in pk_map[table] if x.strip()]
 
-            val = row[field]
-            vstr = excel_like_str(val)
+    # 通用校验
+    for it in table_rules:
+        field = it.get("field")
+        if not field or field not in df.columns:
+            continue  # 忽略字段名不一致
+        req = it.get("required", False)
+        max_len = it.get("max_len", None)
+        decimals = it.get("decimals", None)
+        enum = it.get("enum", None)
+
+        for idx, row in df.iterrows():
+            val = row.get(field, None)
+            pk = build_pk_value(row, pk_fields)
 
             # 必填
-            if rule.get("required", False):
-                if not coerce_required(val):
-                    msg = "必填字段为空"
-                    errors.append({
-                        "表名": table, "行号": idx + 2, "主键": pk,
-                        "字段": field, "错误类型": "必填缺失", "错误信息": msg,
-                        "建议修复": "按模板填写，若无请填0或按说明填'无'",
-                        "原始值": vstr
-                    })
-                    annotated_msgs[idx].append(f"[{field}] {msg}")
-                    continue
+            if req and (pd.isna(val) or str(val).strip()==""):
+                errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": field,
+                               "错误类型": "必填缺失", "错误信息": "必填字段为空", "建议修复": "若无请填0/按规则给定默认值", "原始值": ""})
+                adf.at[idx, "__校验错误__"] += f"[{field} 必填] "
+
+            # 长度（字段级“等于”覆盖全局策略）
+            if max_len is not None and isinstance(val, str):
+                use_strict = bool(it.get("len_equals", False)) or (length_mode == "strict")
+                if use_strict and len(val) != max_len:
+                    errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": field,
+                                   "错误类型": "长度不符", "错误信息": f"长度应等于{max_len}", "建议修复": "修正字符长度", "原始值": val})
+                    adf.at[idx, "__校验错误__"] += f"[{field} 长度= {max_len}] "
+                elif (not use_strict) and len(val) > max_len:
+                    errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": field,
+                                   "错误类型": "长度超限", "错误信息": f"长度应≤{max_len}", "建议修复": "截断或精简内容", "原始值": val})
+                    adf.at[idx, "__校验错误__"] += f"[{field} 长度≤ {max_len}] "
+
+            # 小数位
+            if decimals is not None and not pd.isna(val) and str(val).strip()!="":
+                try:
+                    d = Decimal(str(val))
+                    frac = str(d.normalize()).split(".")[1] if "." in str(d.normalize()) else ""
+                    if len(frac) > decimals:
+                        errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": field,
+                                       "错误类型": "小数位超限", "错误信息": f"小数位应≤{decimals}", "建议修复": f"保留{decimals}位小数", "原始值": str(val)})
+                        adf.at[idx, "__校验错误__"] += f"[{field} 小数位≤{decimals}] "
+                except Exception:
+                    pass
 
             # 枚举
-            dropdown = rule.get("dropdown")
-            if dropdown and vstr != "":
-                allowed = set(dropdown.get("values", []))
-                if vstr not in allowed:
-                    msg = f"值 '{vstr}' 不在允许集合（示例：{sorted(list(allowed))[:5]}...）"
-                    errors.append({
-                        "表名": table, "行号": idx + 2, "主键": pk,
-                        "字段": field, "错误类型": "取值不在给定选项", "错误信息": msg,
-                        "建议修复": "使用下拉选项，不要手填或复制旧版码值",
-                        "原始值": vstr
-                    })
-                    annotated_msgs[idx].append(f"[{field}] 取值非法")
+            if enum and not pd.isna(val) and str(val).strip()!="":
+                sval = str(val).strip()
+                if sval not in enum:
+                    errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": field,
+                                   "错误类型": "取值非法", "错误信息": f"应在{sorted(list(enum))}内", "建议修复": "从下拉/码值中选择合法项", "原始值": sval})
+                    adf.at[idx, "__校验错误__"] += f"[{field} 取值非法] "
 
-            # 上市类型
-            if table == "中央企业各级次单位信息情况表" and field == "上市类型" and vstr != "":
-                ok, msg = validate_listing_type(vstr)
-                if not ok:
-                    errors.append({
-                        "表名": table, "行号": idx + 2, "主键": pk,
-                        "字段": field, "错误类型": "上市类型格式错误", "错误信息": msg,
-                        "建议修复": "示例：a|b|c 或 i",
-                        "原始值": vstr
-                    })
-                    annotated_msgs[idx].append(f"[上市类型] {msg}")
+    # 特例：上市类型、实发数、人工成本总额
+    if table == "中央企业各级次单位信息情况表" and "上市类型" in df.columns:
+        for idx, row in df.iterrows():
+            v = str(row.get("上市类型", "")).strip()
+            if v == "":
+                continue
+            parts = v.split("|")
+            ok = True
+            if any(not re.fullmatch(r"[a-i]", p) for p in parts):
+                ok = False; reason = "仅允许 a~i 以及分隔符 '|'"
+            elif len(parts) != len(set(parts)):
+                ok = False; reason = "不允许重复值（如 a|a）"
+            elif "i" in parts and len(parts) > 1:
+                ok = False; reason = "i 不能与其他值同时出现"
+            if not ok:
+                pk = build_pk_value(row, pk_fields)
+                errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": "上市类型",
+                               "错误类型": "取值非法", "错误信息": reason, "建议修复": "参照规则填写如 a|b 或 i", "原始值": v})
+                adf.at[idx, "__校验错误__"] += "[上市类型 取值非法] "
 
-            # 字符集
-            allowed_charset = rule.get("allowed_charset")
-            if allowed_charset and vstr != "":
-                if not re.fullmatch(allowed_charset, vstr):
-                    msg = f"不满足字符集限制：{allowed_charset}"
-                    errors.append({
-                        "表名": table, "行号": idx + 2, "主键": pk,
-                        "字段": field, "错误类型": "非法字符", "错误信息": msg,
-                        "建议修复": "去除非法字符或更换输入方式",
-                        "原始值": vstr
-                    })
-                    annotated_msgs[idx].append(f"[{field}] 非法字符")
+    if table == "中央企业职工收入情况表":
+        need = ["实发数","总收入","工资总额外的福利费用","应扣合计"]
+        present = [c for c in need if c in df.columns]
+        if len(present) == 4:
+            for idx, row in df.iterrows():
+                pk = build_pk_value(row, pk_fields)
+                d_actual = to_decimal(row.get("实发数"), 2)
+                d_expect = (to_decimal(row.get("总收入"),2) +
+                            to_decimal(row.get("工资总额外的福利费用"),2) -
+                            to_decimal(row.get("应扣合计"),2)).quantize(Decimal("0.01"))
+                if (d_actual - d_expect).copy_abs() > Decimal("0.01"):
+                    errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": "实发数",
+                                   "错误类型": "公式不匹配", "错误信息": f"应= 总收入+工资总额外的福利费用-应扣合计（期望{d_expect} 实际{d_actual}）",
+                                   "建议修复": "检查三项金额及小数位；若无请填0，保留两位小数", "原始值": str(row.get("实发数"))})
+                    adf.at[idx, "__校验错误__"] += "[实发数 公式不匹配] "
 
-            # 长度
-            max_len = rule.get("max_len")
-            exact_len = rule.get("exact_len")
-            if vstr != "":
-                if length_mode == "strict" and exact_len:
-                    if len(vstr) != int(exact_len):
-                        msg = f"长度应= {exact_len}，当前 {len(vstr)}"
-                        errors.append({
-                            "表名": table, "行号": idx + 2, "主键": pk,
-                            "字段": field, "错误类型": "长度不等于要求", "错误信息": msg,
-                            "建议修复": "按模板长度填写",
-                            "原始值": vstr
-                        })
-                        annotated_msgs[idx].append(f"[{field}] 长度不等于{exact_len}")
+    if table == "中央企业各级单位人工成本情况表":
+        # 基础明细列（常见15项，不含“技术奖酬金”与“非货币性福利”，这两项单独处理以兼容别名/新增）
+        base_leaf = [
+            "职工工资总额","社会保险费用","住房公积金","住房补贴",
+            "企业年金和职业年金","补充医疗保险",
+            "福利费用","劳动保护费","工会经费","教育培训经费",
+            "辞退福利",
+            "股份支付","其他人工成本","劳务派遣费"
+        ]
+        tech_aliases = [
+            "技术奖酬金及业务设计奖",
+            "技术奖酬金及业余设计奖",
+            "技术奖酬金及业务(设计)奖",
+            "技术奖酬金及业务／设计奖",
+            "技术奖酬金及业务-设计奖",
+            "技术奖酬金及业务、设计奖"
+        ]
+        top_cols = [
+            "职工工资总额","社会保险费用","住房公积金","住房补贴",
+            "非货币性福利","股份支付","其他人工成本","劳务派遣费"
+        ]
+        def pick_leaf_cols(df_):
+            cols = [c for c in base_leaf if c in df_.columns]
+            # 技术奖酬金… 选中第一个匹配的别名
+            for alias in tech_aliases:
+                if alias in df_.columns:
+                    cols.append(alias)
+                    break
+            # 非货币性福利（若有则加入明细）
+            if "非货币性福利" in df_.columns:
+                cols.append("非货币性福利")
+            # 去重保持顺序
+            seen = set(); uniq = []
+            for c in cols:
+                if c not in seen:
+                    seen.add(c); uniq.append(c)
+            return uniq
+
+        if "企业人工成本总额" in df.columns:
+            present_leaf = pick_leaf_cols(df)
+            use_leaf = len(present_leaf) >= 8
+            cols = present_leaf if use_leaf else [c for c in top_cols if c in df.columns]
+            for idx, row in df.iterrows():
+                pk = build_pk_value(row, pk_fields)
+                d_total = to_decimal(row.get("企业人工成本总额"), 2)
+                parts_sum = sum((to_decimal(row.get(c),2) for c in cols), Decimal("0.00")).quantize(Decimal("0.01"))
+                if use_leaf:
+                    if d_total + Decimal("0.01") < parts_sum:
+                        errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": "企业人工成本总额",
+                                       "错误类型": "合计不足", "错误信息": f"应≥ {cols} 之和（期望≥{parts_sum} 实际{d_total}）",
+                                       "建议修复": "补齐分项或核对总额；若无请填0", "原始值": str(row.get("企业人工成本总额"))})
+                        adf.at[idx, "__校验错误__"] += "[企业人工成本总额 合计不足] "
                 else:
-                    limit = max_len or exact_len
-                    if limit and len(vstr) > int(limit):
-                        msg = f"长度应≤ {limit}，当前 {len(vstr)}"
-                        errors.append({
-                            "表名": table, "行号": idx + 2, "主键": pk,
-                            "字段": field, "错误类型": "长度超限", "错误信息": msg,
-                            "建议修复": "精简文本或去掉多余空格/符号",
-                            "原始值": vstr
-                        })
-                        annotated_msgs[idx].append(f"[{field}] 长度超限")
+                    if (d_total - parts_sum).copy_abs() > Decimal("0.01"):
+                        errors.append({"表名": table, "行号": idx+2, "主键": pk, "字段": "企业人工成本总额",
+                                       "错误类型": "合计不匹配", "错误信息": f"应= {cols} 之和（期望{parts_sum} 实际{d_total}）",
+                                       "建议修复": "逐项核对；若无请填0，合计保留两位小数", "原始值": str(row.get("企业人工成本总额"))})
+                        adf.at[idx, "__校验错误__"] += "[企业人工成本总额 合计不匹配] "
 
-            # 数值/小数位
-            ftype = rule.get("type")
-            if ftype in ("number", "int") and vstr != "":
-                d = to_decimal(vstr, places=rule.get("dec_len", 2) or 2)
-                if d is None:
-                    msg = "数字格式错误（勿带千分位/单位/空格）"
-                    errors.append({
-                        "表名": table, "行号": idx + 2, "主键": pk,
-                        "字段": field, "错误类型": "数字格式错误", "错误信息": msg,
-                        "建议修复": "仅填写纯数字，单位见字段说明",
-                        "原始值": vstr
-                    })
-                    annotated_msgs[idx].append(f"[{field}] 数字格式错")
-                else:
-                    int_len = rule.get("int_len")
-                    if int_len:
-                        digits_before = len(str(d).split('.')[0].replace('-', ''))
-                        if digits_before > int(int_len):
-                            msg = f"整数位应≤ {int_len}"
-                            errors.append({
-                                "表名": table, "行号": idx + 2, "主键": pk,
-                                "字段": field, "错误类型": "整数位超限", "错误信息": msg,
-                                "建议修复": "核对数量级是否正确；去除多余字符",
-                                "原始值": vstr
-                            })
-                            annotated_msgs[idx].append(f"[{field}] 整数位超限")
-                    dec_len = rule.get("dec_len")
-                    if dec_len is not None:
-                        if count_decimal_places(d) > int(dec_len):
-                            msg = f"小数位应≤ {dec_len}"
-                            errors.append({
-                                "表名": table, "行号": idx + 2, "主键": pk,
-                                "字段": field, "错误类型": "小数位超限", "错误信息": msg,
-                                "建议修复": "四舍五入至两位小数",
-                                "原始值": vstr
-                            })
-                            annotated_msgs[idx].append(f"[{field}] 小数位超限")
+    return errors, adf
 
-        # 公式：实发数
-        if table == "中央企业职工收入情况表":
-            needed = ["实发数", "总收入", "工资总额外的福利费用", "应扣合计"]
-            if all(col in df.columns for col in needed):
-                d_sf = to_decimal(row["实发数"], 2)
-                d_zsr = to_decimal(row["总收入"], 2) or Decimal("0.00")
-                d_fl = to_decimal(row["工资总额外的福利费用"], 2) or Decimal("0.00")
-                d_yk = to_decimal(row["应扣合计"], 2) or Decimal("0.00")
-                if d_sf is not None:
-                    expect = (d_zsr + d_fl - d_yk).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                    if abs(expect - d_sf) > Decimal("0.01"):
-                        msg = f"应= 总收入+工资总额外的福利费用-应扣合计（期望{expect} 实际{d_sf}）"
-                        errors.append({
-                            "表名": table, "行号": idx + 2, "主键": pk,
-                            "字段": "实发数", "错误类型": "公式不匹配", "错误信息": msg,
-                            "建议修复": "直接填计算后的数值，保留两位小数",
-                            "原始值": str(row.get("实发数"))
-                        })
-                        annotated_msgs[idx].append(f"[实发数] 公式不匹配")
+def validate_cross_tables(dfs: dict, master_dup_mode="summary"):
+    cross_errors = []
+    cross_sheets = {}
 
-        # 公式：企业人工成本总额
-        if table == "中央企业各级单位人工成本情况表":
-            sum_items = ["职工工资总额", "社会保险费用", "住房公积金", "住房补贴", "非货币性福利", "股份支付", "其他人工成本", "劳务派遣费"]
-            if "企业人工成本总额" in df.columns and all(col in df.columns for col in sum_items):
-                d_total = to_decimal(row["企业人工成本总额"], 2)
-                if d_total is not None:
-                    parts = [to_decimal(row[c], 2) or Decimal("0.00") for c in sum_items]
-                    expect = sum(parts, start=Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                    if abs(expect - d_total) > Decimal("0.01"):
-                        msg = f"应为 {sum_items} 之和（期望{expect} 实际{d_total}）"
-                        errors.append({
-                            "表名": table, "行号": idx + 2, "主键": pk,
-                            "字段": "企业人工成本总额", "错误类型": "合计不匹配", "错误信息": msg,
-                            "建议修复": "逐项核对，若无请填0，合计保留两位小数",
-                            "原始值": str(row.get("企业人工成本总额"))
-                        })
-                        annotated_msgs[idx].append(f"[企业人工成本总额] 合计不匹配")
+    df1 = dfs.get("中央企业各级次单位信息情况表", pd.DataFrame())
+    df2 = dfs.get("中央企业职工收入情况表", pd.DataFrame())
+    df4 = dfs.get("中央企业各级单位人工成本情况表", pd.DataFrame())
 
-    annotated_df = df.copy()
-    anno_col = "__校验错误__"
-    annotated_df[anno_col] = ""
-    for idx, msgs in annotated_msgs.items():
-        annotated_df.at[idx, anno_col] = "；".join(msgs)
+    key_code = "统一社会信用代码"
+    key_name = "单位名称"
 
-    return errors, annotated_df
+    key_col = key_code if key_code in df1.columns else (key_name if key_name in df1.columns else None)
+    set1 = set()
+    if key_col:
+        set1 = set([str(v).strip() for v in df1[key_col].dropna().astype(str)])
 
+    if not df2.empty:
+        if key_code in df2.columns or key_name in df2.columns:
+            df2_chk = df2.copy()
+            use_col = key_code if key_code in df2.columns else key_name
+            df2_chk["__存在于表1__"] = df2_chk[use_col].astype(str).str.strip().isin(set1) if key_col else True
+            cross_sheets["表间-职工收入vs单位信息"] = df2_chk[[c for c in df2_chk.columns if c != "__校验错误__"]]
+            if key_col:
+                for idx, row in df2.iterrows():
+                    v = str(row.get(use_col, "")).strip()
+                    if v and v not in set1:
+                        cross_errors.append({"表名": "中央企业职工收入情况表", "行号": idx+2, "主键": "",
+                                             "字段": use_col, "错误类型": "表间未匹配", "错误信息": f"{use_col} 在表1不存在",
+                                             "建议修复": "先在表1维护主数据，再填表2", "原始值": v})
 
-# -----------------------------
-# 表间校验（引用一致性 + 主数据重复）
-# -----------------------------
+    if not df4.empty:
+        if key_code in df4.columns or key_name in df4.columns:
+            df4_chk = df4.copy()
+            use_col = key_code if key_code in df4.columns else key_name
+            df4_chk["__存在于表1__"] = df4_chk[use_col].astype(str).str.strip().isin(set1) if key_col else True
+            cross_sheets["表间-人工成本vs单位信息"] = df4_chk[[c for c in df4_chk.columns if c != "__校验错误__"]]
+            if key_col:
+                for idx, row in df4.iterrows():
+                    v = str(row.get(use_col, "")).strip()
+                    if v and v not in set1:
+                        cross_errors.append({"表名": "中央企业各级单位人工成本情况表", "行号": idx+2, "主键": "",
+                                             "字段": use_col, "错误类型": "表间未匹配", "错误信息": f"{use_col} 在表1不存在",
+                                             "建议修复": "先在表1维护主数据，再填表4", "原始值": v})
 
-REF_KEYS = [
-    "统一社会信用代码",
-    "子企业统一社会信用代码",
-    "单位统一社会信用代码",
-]
+    dup_sheet = None
+    if not df1.empty and (("统一社会信用代码" in df1.columns) or ("单位名称" in df1.columns)):
+        cols = [c for c in ["统一社会信用代码","单位名称"] if c in df1.columns]
+        if cols:
+            dup = df1[df1.duplicated(subset=cols, keep=False)].sort_values(by=cols)
+            if not dup.empty:
+                dup_sheet = dup
+                if master_dup_mode in ("inline",):
+                    for idx, row in dup.iterrows():
+                        cross_errors.append({"表名": "中央企业各级次单位信息情况表", "行号": idx+2, "主键": "",
+                                             "字段": ",".join(cols), "错误类型": "主数据重复",
+                                             "错误信息": f"主数据重复：{cols}", "建议修复": "去重后再进行表间匹配", "原始值": ""})
+    if dup_sheet is not None and master_dup_mode in ("summary","inline"):
+        cross_sheets["主数据-重复检查"] = dup_sheet
 
-NAME_KEYS = [
-    "子企业单位名称",
-    "单位名称",
-]
+    return cross_sheets, cross_errors
 
-def norm_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    s = s.replace('\u3000', ' ')
-    return re.sub(r'\s+', '', s)
+def parse_pk_map(pk_arg: str):
+    if not pk_arg:
+        return {}
+    pk_map = {}
+    parts = re.split(r"[;；]\s*", pk_arg.strip())
+    for p in parts:
+        if not p: continue
+        if ":" not in p: continue
+        t, cols = p.split(":", 1)
+        t = t.strip()
+        cols = [c.strip() for c in re.split(r"[,，]\s*", cols) if c.strip()]
+        if t and cols:
+            pk_map[t] = cols
+    return pk_map
 
-def detect_master_duplicates(df_master: pd.DataFrame) -> pd.DataFrame:
-    """返回主数据重复的详细列表（按列逐个检测），不含空值"""
-    records = []
-    for col in REF_KEYS + NAME_KEYS:
-        if col in df_master.columns:
-            ser = df_master[col].astype(str).str.strip()
-            ser = ser[ser != ""].dropna()
-            dup_mask = ser.duplicated(keep=False)
-            if dup_mask.any():
-                dups = df_master.loc[dup_mask, [col]].copy()
-                dups["重复列"] = col
-                dups["重复值(规范化)"] = dups[col].astype(str).str.replace('\u3000',' ').str.replace(r'\s+','',regex=True)
-                records.append(dups)
-    if records:
-        out = pd.concat(records, axis=0)
-        out = out[["重复列", "重复值(规范化)", out.columns[0]]]
-        out = out.rename(columns={out.columns[2]:"原始值"})
-        out = out.drop_duplicates()
-        return out
-    return pd.DataFrame(columns=["重复列","重复值(规范化)","原始值"])
-
-
-def cross_validate_against_master(df_master: pd.DataFrame,
-                                  df_child: pd.DataFrame,
-                                  child_table: str,
-                                  pk_map: Dict[str, List[str]],
-                                  inline_master_dup_msgs: bool,
-                                  master_dup_msgs: List[str]) -> List[Dict[str, Any]]:
-    errs: List[Dict[str, Any]] = []
-
-    # 可选：把主数据重复的摘要信息打到子表
-    if inline_master_dup_msgs:
-        for m in master_dup_msgs:
-            errs.append({
-                "表名": child_table, "行号": "", "主键": "", "字段": "",
-                "错误类型": "主数据重复", "错误信息": m,
-                "建议修复": "请先去重表1关键字段（代码/名称），避免跨表匹配歧义",
-                "原始值": ""
-            })
-
-    # Build index
-    codes: Set[str] = set()
-    names: Set[str] = set()
-    for code_col in REF_KEYS:
-        if code_col in df_master.columns:
-            vals = [str(v).strip() for v in df_master[code_col].dropna().tolist() if str(v).strip() != ""]
-            codes.update(vals)
-    for name_col in NAME_KEYS:
-        if name_col in df_master.columns:
-            vals = [norm_text(v) for v in df_master[name_col].dropna().tolist() if str(v).strip() != ""]
-            names.update(vals)
-
-    # 子表逐行检查
-    for idx, row in df_child.iterrows():
-        pk = build_pk(row, df_child.columns.tolist(), pk_map.get(child_table, []))
-
-        # code
-        code = None
-        for k in REF_KEYS:
-            if k in df_child.columns and not pd.isna(row.get(k)) and str(row.get(k)).strip() != "":
-                code = str(row.get(k)).strip()
-                break
-
-        # name
-        name = None
-        for k in NAME_KEYS:
-            if k in df_child.columns and not pd.isna(row.get(k)) and str(row.get(k)).strip() != "":
-                name = str(row.get(k)).strip()
-                break
-
-        # 1) 引用存在性
-        if code and code not in codes:
-            errs.append({
-                "表名": child_table, "行号": idx + 2, "主键": pk,
-                "字段": "统一社会信用代码/相关代码", "错误类型": "表间引用不存在",
-                "错误信息": f"代码 {code} 未在表1中找到",
-                "建议修复": "请先在表1新增/修正该单位，再在子表中引用",
-                "原始值": code
-            })
-
-        if (not code) and name:
-            n = norm_text(name)
-            if n not in names:
-                errs.append({
-                    "表名": child_table, "行号": idx + 2, "主键": pk,
-                    "字段": "单位名称", "错误类型": "表间引用不存在",
-                    "错误信息": f"名称 {name} 未在表1中找到",
-                    "建议修复": "请先在表1新增/修正该单位，再在子表中引用",
-                    "原始值": name
-                })
-
-        # 2) 名称一致性（当 code + name 同时存在时）
-        if code and name:
-            master_names = set()
-            for name_col in NAME_KEYS:
-                if name_col in df_master.columns and "统一社会信用代码" in df_master.columns:
-                    for _, r in df_master[df_master["统一社会信用代码"] == code].iterrows():
-                        master_names.add(norm_text(r.get(name_col)))
-                if name_col in df_master.columns and "子企业统一社会信用代码" in df_master.columns:
-                    for _, r in df_master[df_master["子企业统一社会信用代码"] == code].iterrows():
-                        master_names.add(norm_text(r.get(name_col)))
-            if master_names:
-                if norm_text(name) not in master_names:
-                    errs.append({
-                        "表名": child_table, "行号": idx + 2, "主键": pk,
-                        "字段": "单位名称", "错误类型": "表间名称不一致",
-                        "错误信息": f"代码 {code} 在表1对应名称为 {list(master_names)[:3]}，而本表填写为 {name}",
-                        "建议修复": "以表1名称为准修正子表；若表1名称错误请先修正表1",
-                        "原始值": name
-                    })
-
-    return errs
-
-
-# -----------------------------
-# 主流程
-# -----------------------------
+def unique_sheet_name(base: str, used: set) -> str:
+    name = base[:31]
+    if name not in used:
+        used.add(name); return name
+    i = 2
+    while True:
+        suffix = f"~{i}"
+        name2 = (base[:31-len(suffix)] + suffix)
+        if name2 not in used:
+            used.add(name2); return name2
+        i += 1
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="待校验数据：单个Excel工作簿（多Sheet）或目录（每表一个Excel）")
-    parser.add_argument("--rules-xlsx", required=False, help="V2.2 规则Excel路径（推荐）")
-    parser.add_argument("--sheet", required=False, default="央企端-表内校验", help="规则Sheet名（默认：央企端-表内校验）")
-    parser.add_argument("--codes-sheet", required=False, help="码值/字典Sheet名（可选）")
-    parser.add_argument("--rules-json", required=False, default="rules_intra_compiled.json", help="若无rules-xlsx则读取该JSON")
-    parser.add_argument("--dump-rules-json", required=False, help="将编译后的规则另存为JSON（可选）")
-    parser.add_argument("--tables", nargs="*", help="需要校验的表名（留空则对规则中全部表进行校验）")
-    parser.add_argument("--length-mode", choices=["max", "strict"], default="max", help="长度模式：max=≤上限；strict=等于exact_len")
-    parser.add_argument("--pk", action="append", help="主键映射：格式 表名:字段1,字段2 （可多次填写不同表）")
-    parser.add_argument("--no-annotated", action="store_true", help="不输出“标注-表名”Sheet")
-    parser.add_argument("--master-dup-report", choices=["inline","summary","off"], default="summary",
-                        help="主数据重复提示输出位置：inline=写入各表间Sheet；summary=独立Sheet；off=不提示")
-    parser.add_argument("--output", required=True, help="输出Excel文件路径（.xlsx）")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True, help="待校验数据：Excel文件(多Sheet) 或 目录（每表一个Excel）")
+    ap.add_argument("--rules-xlsx", required=True, help="V2.2 规则Excel")
+    ap.add_argument("--sheet", default="央企端-表内校验", help="规则所在Sheet名，默认：央企端-表内校验")
+    ap.add_argument("--codes-sheet", default="码值表", help="码值Sheet名（可空）")
+    ap.add_argument("--rules-json", help="（可选）已编译规则JSON")
+    ap.add_argument("--dump-rules-json", help="（可选）把编译好的规则导出到JSON文件")
+    ap.add_argument("--tables", nargs="*", help="只校验指定表（留空=按规则里所有表）")
+    ap.add_argument("--assume-single-sheet", action="store_true", help="兼容模式：目录中Excel只读第一个Sheet")
+    ap.add_argument("--length-mode", choices=["max","strict"], default="max", help="长度策略：max=≤上限，strict=等于上限")
+    ap.add_argument("--pk", help='主键映射，如："中央企业职工收入情况表:统一社会信用代码,证件号码,姓名"；可用分号拼多表')
+    ap.add_argument("--no-annotated", dest="no_annotated", action="store_true", help="不输出“标注-表名”Sheet")
+    ap.add_argument("--master-dup-report", choices=["inline","summary","off"], default="summary", help="主数据重复提示输出位置")
+    ap.add_argument("--output", required=True, help="输出Excel路径")
+    args = ap.parse_args()
 
-    # 规则
-    if args.rules_xlsx:
-        rules_compiled = compile_rules_from_excel(Path(args.rules_xlsx), sheet_name=args.sheet, codes_sheet=args.codes_sheet)
-        if args.dump_rules_json:
-            Path(args.dump_rules_json).write_text(json.dumps(rules_compiled, ensure_ascii=False, indent=2), encoding="utf-8")
-    else:
-        rp = Path(args.rules_json)
-        if not rp.exists():
-            raise FileNotFoundError(f"未找到规则：{rp}，请提供 --rules-xlsx 或 --rules-json")
-        rules_compiled = json.loads(Path(args.rules_json).read_text(encoding="utf-8"))
-
-    # 目标表
-    target_tables = args.tables if args.tables else list(rules_compiled.keys())
-
-    # 主键映射
-    pk_map: Dict[str, List[str]] = {}
-    if args.pk:
-        for item in args.pk:
-            if ":" in item:
-                t, cols = item.split(":", 1)
-                pk_map[t.strip()] = [c.strip() for c in cols.split(",") if c.strip()]
-
-    # 加载数据
     data_path = Path(args.data)
-    frames = sheet_loader(data_path, target_tables)
-
-    # 写入引擎自动选择
-    try:
-        import xlsxwriter  # noqa
-        _engine = "xlsxwriter"
-    except Exception:
-        _engine = "openpyxl"
-
+    rules_path = Path(args.rules_xlsx)
     out_path = Path(args.output)
-    if out_path.suffix.lower() != ".xlsx":
-        raise ValueError("输出文件必须是 .xlsx")
 
-    with pd.ExcelWriter(out_path, engine=_engine) as xw:
-        overview_rows: List[Dict[str, Any]] = []
+    dfs = read_data_any(data_path)
 
-        # 表内校验 + 标注
-        for t in target_tables:
-            if t not in frames:
-                overview_rows.append({"表名": t, "问题数": 1, "备注": "未找到该表数据"})
-                pd.DataFrame([{"提示": f"未在数据源中找到表/Sheet：{t}"}]).to_excel(xw, index=False, sheet_name=f"错误-{t[:25]}")
-                continue
-            if t not in rules_compiled:
-                overview_rows.append({"表名": t, "问题数": 1, "备注": "未找到该表规则"})
-                pd.DataFrame([{"提示": f"规则未包含该表：{t}"}]).to_excel(xw, index=False, sheet_name=f"错误-{t[:25]}")
-                continue
+    compiled = compile_rules_from_excel(rules_path, sheet_name=args.sheet, codes_sheet=args.codes_sheet)
+    if args.rules_json and Path(args.rules_json).exists():
+        try:
+            compiled = json.loads(Path(args.rules_json).read_text("utf-8"))
+        except Exception:
+            pass
+    if args.dump_rules_json:
+        try:
+            Path(args.dump_rules_json).write_text(json.dumps(compiled, ensure_ascii=False, indent=2), "utf-8")
+        except Exception:
+            pass
 
-            df = frames[t]
-            table_rules = rules_compiled[t]
+    tables = args.tables if args.tables else EXPECTED_TABLES
+    tables = [t for t in tables if t in EXPECTED_TABLES]
 
-            errs, annotated_df = validate_dataframe(df, t, table_rules, length_mode=args.length_mode, pk_map=pk_map)
-            err_df = pd.DataFrame(errs) if errs else pd.DataFrame(columns=["表名","行号","主键","字段","错误类型","错误信息","建议修复","原始值"])
-            err_df.to_excel(xw, index=False, sheet_name=f"错误-{t[:25]}")
+    pk_map = parse_pk_map(args.pk or "")
+
+    all_errors = []
+    annotated = {}
+    for t in tables:
+        df = dfs.get(t, pd.DataFrame())
+        errs, adf = validate_dataframe(df, t, compiled, length_mode=args.length_mode, pk_map=pk_map)
+        all_errors.extend(errs)
+        annotated[t] = adf
+
+    cross_sheets, cross_errors = validate_cross_tables(dfs, master_dup_mode=args.master_dup_report)
+    all_errors.extend(cross_errors)
+
+    engine = "xlsxwriter"
+    try:
+        import xlsxwriter  # noqa: F401
+    except Exception:
+        engine = "openpyxl"
+
+    with pd.ExcelWriter(out_path, engine=engine) as xw:
+        used_names = set()
+
+        for t in tables:
+            adf = annotated.get(t, pd.DataFrame())
+            err_rows = [e for e in all_errors if e["表名"] == t]
+            err_df = pd.DataFrame(err_rows) if err_rows else pd.DataFrame(columns=["表名","行号","主键","字段","错误类型","错误信息","建议修复","原始值"])
+            err_df.to_excel(xw, sheet_name=unique_sheet_name(f"错误-{t}", used_names), index=False)
             if not args.no_annotated:
-                annotated_df.to_excel(xw, index=False, sheet_name=f"标注-{t[:24]}")
-            overview_rows.append({"表名": t, "问题数": len(errs), "备注": ""})
+                adf.to_excel(xw, sheet_name=unique_sheet_name(f"标注-{t}", used_names), index=False)
 
-        # 表间校验（以表1为主数据表）
-        MASTER = "中央企业各级次单位信息情况表"
-        if MASTER in frames:
-            df_master = frames[MASTER]
+        for name, sdf in cross_sheets.items():
+            sdf.to_excel(xw, sheet_name=unique_sheet_name(name, used_names), index=False)
 
-            # 主数据重复检查：summary / inline / off
-            master_dup_df = detect_master_duplicates(df_master)
-            master_dup_msgs = []
-            if not master_dup_df.empty:
-                for col in (master_dup_df["重复列"].unique().tolist()):
-                    master_dup_msgs.append(f"{col} 存在重复")
-                if args.master_dup_report in ("summary", "inline"):
-                    if args.master_dup_report == "summary":
-                        master_dup_df.to_excel(xw, index=False, sheet_name="主数据-重复检查")
-                        overview_rows.append({"表名": "主数据-重复检查", "问题数": len(master_dup_df), "备注": "表间"})
-                # else off -> 不输出
-
-            # 对照的子表
-            child_pairs = [
-                ("中央企业职工收入情况表", "表间-职工收入vs单位信息"),
-                ("中央企业各级单位人工成本情况表", "表间-人工成本vs单位信息"),
-            ]
-
-            inline_flag = (args.master_dup_report == "inline")
-            for child_name, sheet_alias in child_pairs:
-                if child_name in frames:
-                    cross_errs = cross_validate_against_master(df_master, frames[child_name], child_name,
-                                                               pk_map, inline_flag, master_dup_msgs)
-                    pd.DataFrame(cross_errs).to_excel(xw, index=False, sheet_name=sheet_alias[:31])
-                    overview_rows.append({"表名": sheet_alias, "问题数": len(cross_errs), "备注": "表间"})
-        else:
-            pd.DataFrame([{"提示": "未找到主数据表（中央企业各级次单位信息情况表），无法做表间校验"}]).to_excel(xw, index=False, sheet_name="表间-提示")
-            overview_rows.append({"表名": "表间-提示", "问题数": 1, "备注": "缺少主数据表"})
-
-        pd.DataFrame(overview_rows).to_excel(xw, index=False, sheet_name="总览")
+        over = []
+        for t in tables:
+            cnt = sum(1 for e in all_errors if e["表名"] == t)
+            over.append({"表名": t, "错误数量": cnt, "记录数": len(annotated.get(t, pd.DataFrame()))})
+        pd.DataFrame(over).to_excel(xw, sheet_name=unique_sheet_name("总览", used_names), index=False)
 
     print(f"完成：输出 {out_path}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
