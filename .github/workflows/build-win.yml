@@ -35,14 +35,12 @@ jobs:
           if (Test-Path requirements.txt) {
             pip install -r requirements.txt
           } else {
-            pip install pandas numpy openpyxl xlsxwriter
+            pip install pandas numpy openpyxl xlsxwriter pyinstaller
           }
-          pip install pyinstaller
 
       - name: Build exe with PyInstaller
         shell: pwsh
         run: |
-          # 单文件、名称固定为 soe_validator.exe；收集常用第三方库资源，避免运行期缺失
           pyinstaller `
             -F `
             --clean `
@@ -52,23 +50,17 @@ jobs:
             --collect-all openpyxl `
             --collect-all xlsxwriter `
             soe_validator_v22_full_v2_fixed.py
-          if (!(Test-Path dist/soe_validator.exe)) {
-            Write-Error "构建失败，未找到 dist/soe_validator.exe"
-          }
-
-      - name: Compute short SHA
-        id: short
-        shell: pwsh
-        run: echo "value=$($env:GITHUB_SHA.Substring(0,7))" >> $env:GITHUB_OUTPUT
+          if (!(Test-Path dist/soe_validator.exe)) { throw "构建失败，未找到 dist/soe_validator.exe" }
 
       - name: Make easy-run package (exe + bat + readme)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
           Copy-Item -Path dist/soe_validator.exe -Destination dist_pkg/
 
-          # 说明
-          $readme = @"
+          # README（注意：用单引号 here-string，避免 YAML 误解析）
+          $readme = @'
 【使用说明】
 1) 将以下 3 个文件放到同一文件夹：
    - soe_validator.exe
@@ -78,11 +70,11 @@ jobs:
 
 【命令行示例】
 soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.3.xlsx" --sheet "央企端-表内校验" --codes-sheet "码值" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "validation_errors_v23.xlsx"
-"@
-          Set-Content -Path dist_pkg/README_使用说明.txt -Value $readme -Encoding UTF8
+'@
+          Set-Content -LiteralPath dist_pkg\README_使用说明.txt -Value $readme -Encoding UTF8
 
-          # 模板批处理（用户双击即可执行；如文件名不同请在批处理中改成自己的）
-          $bat = @"
+          # 批处理模板（双击即可运行）
+          $bat = @'
 @echo off
 chcp 65001 >nul
 set EXE=soe_validator.exe
@@ -106,41 +98,16 @@ if %errorlevel% neq 0 (
 )
 echo 完成：输出 %OUT%
 pause
-"@
-          Set-Content -Path dist_pkg/校验.bat -Value $bat -Encoding UTF8
+'@
+          Set-Content -LiteralPath dist_pkg\校验.bat -Value $bat -Encoding UTF8
 
-          # 压缩
-          $zip = "dist_pkg/soe_validator_${{ steps.short.outputs.value }}.zip"
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          Compress-Archive -Path dist_pkg/* -DestinationPath $zip
+          $short = $env:GITHUB_SHA.Substring(0,7)
+          Compress-Archive -Path dist_pkg\* -DestinationPath dist_pkg\soe_validator_$short.zip
 
-      - name: Upload exe
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: soe_validator_win_${{ steps.short.outputs.value }}
-          path: dist/soe_validator.exe
-
-      - name: Upload zip (exe + bat + readme)
-        uses: actions/upload-artifact@v4
-        with:
-          name: soe_validator_pkg_${{ steps.short.outputs.value }}
-          path: dist_pkg/soe_validator_${{ steps.short.outputs.value }}.zip
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - name: Download package artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: soe_validator_pkg_${{ needs.build.outputs.short }}
-        continue-on-error: true
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
+          name: soe_validator_pkg
+          path: |
+            dist/soe_validator.exe
             dist_pkg/soe_validator_*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
