@@ -1,77 +1,146 @@
-name: Build Windows EXE
+name: build-win
 
 on:
-  workflow_dispatch: {}
-  # 也可以按需启用打 tag 自动发布：
-  # push:
-  #   tags: ['v*']
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # 1) 固定 Python 版本
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
-      # 2) 安装依赖（建议固定到 requirements.txt；没有的话用这里的版本也行）
-      - name: Install deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
         shell: pwsh
         run: |
-          python -m pip install -U pip
-          pip install pandas==2.2.2 numpy==2.0.2 openpyxl==3.1.5 XlsxWriter==3.2.0 pyinstaller==6.9.0
+          python -m pip install --upgrade pip
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          } else {
+            pip install pandas numpy openpyxl xlsxwriter
+          }
+          pip install pyinstaller
 
-      # 3) 版本号注入：给 exe 一个可追踪的版本（tag 优先，否则用短 SHA）
-      - name: Compute version
+      - name: Build exe with PyInstaller
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}"
-          if (-not $ver.StartsWith('v')) { $ver = "dev-${{ github.sha.Substring(0,7) }}" }
-          "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # 单文件、名称固定为 soe_validator.exe；收集常用第三方库资源，避免运行期缺失
+          pyinstaller `
+            -F `
+            --clean `
+            -n soe_validator.exe `
+            --collect-all pandas `
+            --collect-all numpy `
+            --collect-all openpyxl `
+            --collect-all xlsxwriter `
+            soe_validator_v22_full_v2_fixed.py
+          if (!(Test-Path dist/soe_validator.exe)) {
+            Write-Error "构建失败，未找到 dist/soe_validator.exe"
+          }
 
-      # 4) 预检：脚本必须存在
-      - name: Verify files exist
+      - name: Compute short SHA
+        id: short
+        shell: pwsh
+        run: echo "value=$($env:GITHUB_SHA.Substring(0,7))" >> $env:GITHUB_OUTPUT
+
+      - name: Make easy-run package (exe + bat + readme)
         shell: pwsh
         run: |
-          if (!(Test-Path "soe_validator_v22_full_v2_fixed.py")) { throw "Missing soe_validator_v22_full_v2_fixed.py" }
+          New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
+          Copy-Item -Path dist/soe_validator.exe -Destination dist_pkg/
 
-      # 5) 构建：收集 pandas/numpy/openpyxl/XlsxWriter 的运行时资源
-      #    用 --collect-all 最稳，能避免 openpyxl 引擎/模板等资源丢失
-      - name: Build CLI exe
-        shell: pwsh
-        run: >
-          pyinstaller --onefile --clean
-          --name soe_validator
-          --collect-all pandas --collect-all numpy
-          --collect-all openpyxl --collect-all XlsxWriter
-          --add-data "README.md;." 
-          --runtime-tmpdir "." 
-          soe_validator_v22_full_v2_fixed.py
+          # 说明
+          $readme = @"
+【使用说明】
+1) 将以下 3 个文件放到同一文件夹：
+   - soe_validator.exe
+   - 校验.bat
+   - 你的 Excel：待校验数据.xlsx、数据标准2.0数据采集校验规则_V2.3.xlsx
+2) 双击运行“校验.bat”，按提示修改文件名路径即可（中文/含空格请保留引号）
 
-      # 6) 冒烟测试：确保 exe 至少能启动，并输出版本和帮助
-      - name: Smoke test
-        shell: pwsh
-        run: |
-          .\dist\soe_validator.exe --version || exit 1
-          .\dist\soe_validator.exe -h | Select-String "usage:" || exit 1
+【命令行示例】
+soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.3.xlsx" --sheet "央企端-表内校验" --codes-sheet "码值" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "validation_errors_v23.xlsx"
+"@
+          Set-Content -Path dist_pkg/README_使用说明.txt -Value $readme -Encoding UTF8
 
-      # 7) 产物打包（zip 更方便给别人发）
-      - name: Zip artifacts
-        shell: pwsh
-        run: |
-          Compress-Archive -Path dist\soe_validator.exe -DestinationPath dist\soe_validator_windows.zip
+          # 模板批处理（用户双击即可执行；如文件名不同请在批处理中改成自己的）
+          $bat = @"
+@echo off
+chcp 65001 >nul
+set EXE=soe_validator.exe
+set DATA=待校验数据.xlsx
+set RULES=数据标准2.0数据采集校验规则_V2.3.xlsx
+set SHEET=央企端-表内校验
+set CODES=码值
+set OUT=validation_errors_v23.xlsx
 
-      - name: Upload artifacts
+echo ==== 自检文件 ====
+if not exist "%EXE%" echo 未找到 %EXE% & pause & exit /b 2
+if not exist "%DATA%" echo 未找到 %DATA%（按需改名） & pause & exit /b 2
+if not exist "%RULES%" echo 未找到 %RULES%（按需改名） & pause & exit /b 2
+
+echo ==== 开始校验 ====
+"%EXE%" --data "%DATA%" --rules-xlsx "%RULES%" --sheet "%SHEET%" --codes-sheet "%CODES%" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "%OUT%"
+if %errorlevel% neq 0 (
+  echo 运行失败(错误码: %errorlevel%)
+  pause
+  exit /b %errorlevel%
+)
+echo 完成：输出 %OUT%
+pause
+"@
+          Set-Content -Path dist_pkg/校验.bat -Value $bat -Encoding UTF8
+
+          # 压缩
+          $zip = "dist_pkg/soe_validator_${{ steps.short.outputs.value }}.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path dist_pkg/* -DestinationPath $zip
+
+      - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
-          name: windows-build
-          path: |
-            dist/soe_validator.exe
-            dist/soe_validator_windows.zip
-          if-no-files-found: error
+          name: soe_validator_win_${{ steps.short.outputs.value }}
+          path: dist/soe_validator.exe
+
+      - name: Upload zip (exe + bat + readme)
+        uses: actions/upload-artifact@v4
+        with:
+          name: soe_validator_pkg_${{ steps.short.outputs.value }}
+          path: dist_pkg/soe_validator_${{ steps.short.outputs.value }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: soe_validator_pkg_${{ needs.build.outputs.short }}
+        continue-on-error: true
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist_pkg/soe_validator_*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
