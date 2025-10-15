@@ -19,15 +19,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~\AppData\Local\pip\Cache
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install dependencies
         shell: pwsh
         run: |
@@ -59,47 +50,47 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
           Copy-Item -Path dist/soe_validator.exe -Destination dist_pkg/
 
-          # README（注意：用单引号 here-string，避免 YAML 误解析）
-          $readme = @'
-【使用说明】
-1) 将以下 3 个文件放到同一文件夹：
-   - soe_validator.exe
-   - 校验.bat
-   - 你的 Excel：待校验数据.xlsx、数据标准2.0数据采集校验规则_V2.3.xlsx
-2) 双击运行“校验.bat”，按提示修改文件名路径即可（中文/含空格请保留引号）
+          # README（逐行写，避免 here-string 导致 YAML 解析错误）
+          $readmeLines = @(
+            '【使用说明】',
+            '1) 将以下 3 个文件放到同一文件夹：',
+            '   - soe_validator.exe',
+            '   - 校验.bat',
+            '   - 你的 Excel：待校验数据.xlsx、数据标准2.0数据采集校验规则_V2.3.xlsx',
+            '2) 双击运行“校验.bat”，按提示修改文件名路径即可（中文/含空格请保留引号）',
+            '',
+            '【命令行示例】',
+            'soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.3.xlsx" --sheet "央企端-表内校验" --codes-sheet "码值" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "validation_errors_v23.xlsx"'
+          )
+          $readmeLines | Set-Content -LiteralPath dist_pkg\README_使用说明.txt -Encoding UTF8
 
-【命令行示例】
-soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.3.xlsx" --sheet "央企端-表内校验" --codes-sheet "码值" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "validation_errors_v23.xlsx"
-'@
-          Set-Content -LiteralPath dist_pkg\README_使用说明.txt -Value $readme -Encoding UTF8
-
-          # 批处理模板（双击即可运行）
-          $bat = @'
-@echo off
-chcp 65001 >nul
-set EXE=soe_validator.exe
-set DATA=待校验数据.xlsx
-set RULES=数据标准2.0数据采集校验规则_V2.3.xlsx
-set SHEET=央企端-表内校验
-set CODES=码值
-set OUT=validation_errors_v23.xlsx
-
-echo ==== 自检文件 ====
-if not exist "%EXE%" echo 未找到 %EXE% & pause & exit /b 2
-if not exist "%DATA%" echo 未找到 %DATA%（按需改名） & pause & exit /b 2
-if not exist "%RULES%" echo 未找到 %RULES%（按需改名） & pause & exit /b 2
-
-echo ==== 开始校验 ====
-"%EXE%" --data "%DATA%" --rules-xlsx "%RULES%" --sheet "%SHEET%" --codes-sheet "%CODES%" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "%OUT%"
-if %errorlevel% neq 0 (
-  echo 运行失败(错误码: %errorlevel%)
-  pause
-  exit /b %errorlevel%
-)
-echo 完成：输出 %OUT%
-pause
-'@
-          Set-Content -LiteralPath dist_pkg\校验.bat -Value $bat -Encoding UTF8
+          # 批处理（逐行写）
+          $batLines = @(
+            '@echo off',
+            'chcp 65001 >nul',
+            'set EXE=soe_validator.exe',
+            'set DATA=待校验数据.xlsx',
+            'set RULES=数据标准2.0数据采集校验规则_V2.3.xlsx',
+            'set SHEET=央企端-表内校验',
+            'set CODES=码值',
+            'set OUT=validation_errors_v23.xlsx',
+            '',
+            'echo ==== 自检文件 ====',
+            'if not exist "%EXE%" echo 未找到 %EXE% & pause & exit /b 2',
+            'if not exist "%DATA%" echo 未找到 %DATA%（按需改名） & pause & exit /b 2',
+            'if not exist "%RULES%" echo 未找到 %RULES%（按需改名） & pause & exit /b 2',
+            '',
+            'echo ==== 开始校验 ====',
+            '"%EXE%" --data "%DATA%" --rules-xlsx "%RULES%" --sheet "%SHEET%" --codes-sheet "%CODES%" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "%OUT%"',
+            'if %errorlevel% neq 0 (',
+            '  echo 运行失败(错误码: %errorlevel%)',
+            '  pause',
+            '  exit /b %errorlevel%',
+            ')',
+            'echo 完成：输出 %OUT%',
+            'pause'
+          )
+          $batLines | Set-Content -LiteralPath dist_pkg\校验.bat -Encoding UTF8
 
           $short = $env:GITHUB_SHA.Substring(0,7)
           Compress-Archive -Path dist_pkg\* -DestinationPath dist_pkg\soe_validator_$short.zip
