@@ -2,51 +2,70 @@ name: Build Windows EXE
 
 on:
   workflow_dispatch: {}
+  # 也可以按需启用打 tag 自动发布：
   # push:
   #   tags: ['v*']
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Show env
-        shell: pwsh
-        run: |
-          python -V
-          pip -V
-          dir
-
+      # 1) 固定 Python 版本
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
+      # 2) 安装依赖（建议固定到 requirements.txt；没有的话用这里的版本也行）
       - name: Install deps
         shell: pwsh
         run: |
           python -m pip install -U pip
-          pip install pandas numpy openpyxl XlsxWriter pyinstaller
+          pip install pandas==2.2.2 numpy==2.0.2 openpyxl==3.1.5 XlsxWriter==3.2.0 pyinstaller==6.9.0
 
+      # 3) 版本号注入：给 exe 一个可追踪的版本（tag 优先，否则用短 SHA）
+      - name: Compute version
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if (-not $ver.StartsWith('v')) { $ver = "dev-${{ github.sha.Substring(0,7) }}" }
+          "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # 4) 预检：脚本必须存在
       - name: Verify files exist
         shell: pwsh
         run: |
           if (!(Test-Path "soe_validator_v22_full_v2_fixed.py")) { throw "Missing soe_validator_v22_full_v2_fixed.py" }
-          if (Test-Path "soe_validator_gui_win.py") { Write-Host "GUI script found." }
 
-      # —— 关键：整行命令，避免续行符导致的解析错误 ——
+      # 5) 构建：收集 pandas/numpy/openpyxl/XlsxWriter 的运行时资源
+      #    用 --collect-all 最稳，能避免 openpyxl 引擎/模板等资源丢失
       - name: Build CLI exe
         shell: pwsh
-        run: pyinstaller --onefile --clean --name soe_validator --collect-all pandas --collect-all numpy --collect-all openpyxl --collect-all XlsxWriter soe_validator_v22_full_v2_fixed.py
+        run: >
+          pyinstaller --onefile --clean
+          --name soe_validator
+          --collect-all pandas --collect-all numpy
+          --collect-all openpyxl --collect-all XlsxWriter
+          --add-data "README.md;." 
+          --runtime-tmpdir "." 
+          soe_validator_v22_full_v2_fixed.py
 
-      # 可选：GUI（onedir），并把 CLI exe 复制进去，GUI 通过相对路径调用
-      - name: Build GUI exe (optional)
-        if: ${{ hashFiles('soe_validator_gui_win.py') != '' }}
+      # 6) 冒烟测试：确保 exe 至少能启动，并输出版本和帮助
+      - name: Smoke test
         shell: pwsh
         run: |
-          pyinstaller --noconsole --onedir --clean --name SOE_GUI soe_validator_gui_win.py
-          Copy-Item -Force "dist\soe_validator.exe" "dist\SOE_GUI\"
+          .\dist\soe_validator.exe --version || exit 1
+          .\dist\soe_validator.exe -h | Select-String "usage:" || exit 1
+
+      # 7) 产物打包（zip 更方便给别人发）
+      - name: Zip artifacts
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\soe_validator.exe -DestinationPath dist\soe_validator_windows.zip
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -54,5 +73,5 @@ jobs:
           name: windows-build
           path: |
             dist/soe_validator.exe
-            dist/SOE_GUI/**
-          if-no-files-found: warn
+            dist/soe_validator_windows.zip
+          if-no-files-found: error
