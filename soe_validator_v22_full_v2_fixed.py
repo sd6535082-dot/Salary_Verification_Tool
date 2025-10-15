@@ -3,18 +3,12 @@
 SOE Validator (V2.3) - 表内 + 基础跨行校验
 脚本名：soe_validator_v22_full_v2_fixed.py
 
-仅做最小变更，保留你已确认可用的所有逻辑；本版只补三点：
-1) “最高学历”强制白名单（31/41 等均会报错）；
-2) “岗位层级=91-其他 ⇒ 是否在岗 必须为否类(2/3/4/5)”；
-3) 读取值时的极小范围“同义名”兜底（不改列名、不做全局别名），
-   仅针对：
-     - “是否为专职外部董事” ←→ 读取“是否专职外部董事”的值做兜底
-     - “派驻或派出企业名称” ←  读取“派驻或派驻出企业名称”的值做兜底
-   目的：避免已填写却被误判“缺失”。
-4) “是否为派出或派驻人员”≠“3-否” 且已选择时，“派驻或派出企业名称”必须填写（条件必填）。
-5) 金额精度（≤2位小数）保留，使用精度检查追加错误，而不改动既有判断。
-"""
+仅做最小变更，保留你已确认可用的所有逻辑；本版只补两点：
+A) “总收入 = 税前工资性收入 + 中长期激励收入（±0.01）”；
+B) “总收入≤0 时，备注必须填写原因”。
 
+其它逻辑（学历白名单、岗位层级=91-其他⇒是否在岗为否类、条件必填、金额精度、主键一致性等）全部保持不动。
+"""
 import argparse
 import json
 import re
@@ -214,7 +208,7 @@ HR_COST_SUM_FIELDS = [
     "技术奖酬金及业务设计奖","辞退福利","股份支付","其他人工成本","劳务派遣费"
 ]
 
-# 最高学历：严格白名单
+# 最高学历：严格白名单（保留你原来的做法）
 EDU_STRICT_SET = {
     "10-博士研究生","20-硕士研究生","30-大学本科","40-大学专科",
     "50-中专/职高/技校","60-普通高中","70-初中","80-小学及以下"
@@ -429,7 +423,7 @@ def validate_dataframe(
                     })
                     row_msgs.append(f"[{field}] 长度应≤{len_max}")
 
-            # 最高学历：强制白名单（覆盖码值表可能的扩展）
+            # 最高学历：强制白名单
             if field == "最高学历":
                 if sval not in EDU_STRICT_SET:
                     errors.append({
@@ -439,7 +433,6 @@ def validate_dataframe(
                         "允许值": " | ".join(sorted(EDU_STRICT_SET))
                     })
                     row_msgs.append(f"[{field}] 取值不在枚举中")
-                # 即便不在，仍继续后面的常规枚举以保持行为一致（不 return）
 
             # 常规枚举
             enum_set: Set[str] = set(rules.get(field, {}).get("enum") or fr.get("enum") or [])
@@ -496,6 +489,42 @@ def validate_dataframe(
                         "原始值": str(actual_pay), "允许值": f"期望={expect}"
                     })
                     row_msgs.append(f"[实发数] 应=总收入+工资总额外的福利费用-应扣合计（期望={expect} 实际{actual_pay}）")
+
+            # ---- 新增逻辑 A/B：总收入规则（仅追加，不改其它逻辑） ----
+            # A) 总收入 = 税前工资性收入 + 中长期激励收入（±0.01）
+            zsr = try_decimal(_get_cell(row, "总收入"))
+            wage_pre_tax = try_decimal(_get_cell(row, "税前工资性收入"))
+            lti_income = try_decimal(_get_cell(row, "中长期激励收入"))
+            if zsr is not None and (wage_pre_tax is not None or lti_income is not None):
+                expect_zsr = (wage_pre_tax or Decimal("0")) + (lti_income or Decimal("0"))
+                if (zsr - expect_zsr).copy_abs() > Decimal("0.01"):
+                    errors.append({
+                        "表名": table,
+                        "行号": idx + 2,
+                        "主键": pk_of(idx),
+                        "字段": "总收入",
+                        "错误类型": "不等式不满足",
+                        "错误信息": "总收入应=税前工资性收入+中长期激励收入",
+                        "原始值": str(zsr),
+                        "允许值": f"期望={expect_zsr}"
+                    })
+                    row_msgs.append(f"[总收入] 应=税前工资性收入+中长期激励收入（期望={expect_zsr} 实际={zsr}）")
+
+            # B) 总收入≤0 时，备注必须填写原因
+            if zsr is not None and zsr <= Decimal("0"):
+                remark_val = norm(_get_cell(row, "备注"))
+                if remark_val == "":
+                    errors.append({
+                        "表名": table,
+                        "行号": idx + 2,
+                        "主键": pk_of(idx),
+                        "字段": "备注",
+                        "错误类型": "缺失",
+                        "错误信息": "当总收入为0或为负数时，备注必须说明原因",
+                        "原始值": "",
+                        "允许值": "请填写原因（示例：停薪留职/长期病休/离岗待岗/本期无收入等）"
+                    })
+                    row_msgs.append("[备注] 总收入为0或负数时必须填写原因")
 
             # 岗位层级=91-其他 ⇒ 是否在岗 必须为否类（2/3/4/5）
             pos = norm(_get_cell(row, "岗位层级"))
@@ -603,6 +632,72 @@ def cross_check_employee_ops(df_emp: pd.DataFrame) -> pd.DataFrame:
             })
     return pd.DataFrame(errs)
 
+# ===== 表间：主键一致性校验（以主表为准） =====
+def cross_check_master_fk(dfs, writer):
+    """
+    以【中央企业各级次单位信息情况表】为主数据表，使用
+    （子企业统一社会信用代码, 子企业单位名称）作为主键集合，
+    校验其他表中出现的同名两列是否都在主集合中。
+    仅新增检查与输出，不改动任何原有校验流程。
+    """
+    import pandas as _pd
+
+    MASTER = "中央企业各级次单位信息情况表"
+    KEY_CODE = "子企业统一社会信用代码"
+    KEY_NAME = "子企业单位名称"
+
+    if MASTER not in dfs:
+        return
+
+    df_master = dfs[MASTER]
+    if not all(c in df_master.columns for c in [KEY_CODE, KEY_NAME]):
+        return
+
+    def _norm(s):
+        try:
+            return str(s).strip()
+        except Exception:
+            return ""
+
+    master_set = set()
+    for _, r in df_master.iterrows():
+        code = _norm(r.get(KEY_CODE, ""))
+        name = _norm(r.get(KEY_NAME, ""))
+        if code and name:
+            master_set.add((code, name))
+
+    for t, df in dfs.items():
+        if t == MASTER:
+            continue
+        if not all(c in df.columns for c in [KEY_CODE, KEY_NAME]):
+            continue
+
+        rows = []
+        for idx, r in df.iterrows():
+            code = _norm(r.get(KEY_CODE, ""))
+            name = _norm(r.get(KEY_NAME, ""))
+            if not code or not name:
+                rows.append({
+                    "子企业统一社会信用代码": code,
+                    "子企业单位名称": name,
+                    "行号": idx + 2,
+                    "问题描述": "引用缺失（统一社会信用代码/单位名称为空）",
+                })
+                continue
+            if (code, name) not in master_set:
+                rows.append({
+                    "子企业统一社会信用代码": code,
+                    "子企业单位名称": name,
+                    "行号": idx + 2,
+                    "问题描述": "不在主数据（代码+名称）集合中",
+                })
+
+        sheet_name = f"表间-主键一致性检查-{t}"[:31]
+        if rows:
+            _pd.DataFrame(rows).to_excel(writer, index=False, sheet_name=sheet_name)
+        else:
+            _pd.DataFrame(columns=["子企业统一社会信用代码","子企业单位名称","行号","问题描述"]).to_excel(writer, index=False, sheet_name=sheet_name)
+
 # ---------- CLI ----------
 
 def parse_pk_map(pk_arg: Optional[str]) -> Dict[str, List[str]]:
@@ -643,11 +738,12 @@ def main():
         engine = None
 
     with pd.ExcelWriter(args.output, engine=engine) as xw:
-        # 主键一致性（新增调用，不影响其它逻辑）
+        # 先做主键一致性（不影响其它逻辑）
         try:
             cross_check_master_fk(dfs, xw)
         except Exception:
             pass
+
         for t, df in dfs.items():
             table = normalize_table_name(t)
             table_rules = rules_all.get(table, {})
@@ -680,76 +776,6 @@ def main():
                 cross_df.to_excel(xw, index=False, sheet_name=sh[:31])
 
     print(f"完成：输出 {args.output}")
-
-# ===== 表间：主键一致性校验（新增，其他逻辑不改） =====
-def cross_check_master_fk(dfs, writer):
-    """
-    以【中央企业各级次单位信息情况表】为主数据表，使用
-    （子企业统一社会信用代码, 子企业单位名称）作为主键集合，
-    校验其他表中出现的同名两列是否都在主集合中。
-    仅新增检查与输出，不改动任何原有校验流程。
-    """
-    import pandas as _pd
-
-    MASTER = "中央企业各级次单位信息情况表"
-    KEY_CODE = "子企业统一社会信用代码"
-    KEY_NAME = "子企业单位名称"
-
-    if MASTER not in dfs:
-        # 没有主数据表就直接跳过
-        return
-
-    df_master = dfs[MASTER]
-    if not all(c in df_master.columns for c in [KEY_CODE, KEY_NAME]):
-        return
-
-    # 构建主键集合（去除空值）
-    def _norm(s):
-        try:
-            return str(s).strip()
-        except Exception:
-            return ""
-
-    master_set = set()
-    for _, r in df_master.iterrows():
-        code = _norm(r.get(KEY_CODE, ""))
-        name = _norm(r.get(KEY_NAME, ""))
-        if code and name:
-            master_set.add((code, name))
-
-    # 逐子表检查（除主表之外）
-    for t, df in dfs.items():
-        if t == MASTER:
-            continue
-        # 只有当两个关键列都存在时才检查
-        if not all(c in df.columns for c in [KEY_CODE, KEY_NAME]):
-            continue
-
-        rows = []
-        for idx, r in df.iterrows():
-            code = _norm(r.get(KEY_CODE, ""))
-            name = _norm(r.get(KEY_NAME, ""))
-            if not code or not name:
-                rows.append({
-                    "子企业统一社会信用代码": code,
-                    "子企业单位名称": name,
-                    "行号": idx + 2,
-                    "问题描述": "引用缺失（统一社会信用代码/单位名称为空）",
-                })
-                continue
-            if (code, name) not in master_set:
-                rows.append({
-                    "子企业统一社会信用代码": code,
-                    "子企业单位名称": name,
-                    "行号": idx + 2,
-                    "问题描述": "不在主数据（代码+名称）集合中",
-                })
-
-        sheet_name = f"表间-主键一致性检查-{t}"[:31]
-        if rows:
-            _pd.DataFrame(rows).to_excel(writer, index=False, sheet_name=sheet_name)
-        else:
-            _pd.DataFrame(columns=["子企业统一社会信用代码","子企业单位名称","行号","问题描述"]).to_excel(writer, index=False, sheet_name=sheet_name)
 
 if __name__ == "__main__":
     sys.exit(main())
