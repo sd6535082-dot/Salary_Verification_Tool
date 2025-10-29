@@ -26,21 +26,24 @@ jobs:
           if (Test-Path requirements.txt) {
             pip install -r requirements.txt
           } else {
-            pip install pandas numpy openpyxl xlsxwriter pyinstaller
+            pip install pandas numpy openpyxl xlsxwriter et-xmlfile pyinstaller
           }
 
       - name: Build exe with PyInstaller
         shell: pwsh
         run: |
+          # 注意：-n 这里不要带 .exe，PyInstaller 会自动加扩展名
           pyinstaller `
             -F `
             --clean `
-            -n soe_validator.exe `
+            -n soe_validator `
             --collect-all pandas `
             --collect-all numpy `
             --collect-all openpyxl `
             --collect-all xlsxwriter `
+            --collect-all et_xmlfile `
             soe_validator_v22_full_v2_fixed.py
+
           if (!(Test-Path dist/soe_validator.exe)) { throw "构建失败，未找到 dist/soe_validator.exe" }
 
       - name: Make easy-run package (exe + bat + readme)
@@ -50,38 +53,36 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
           Copy-Item -Path dist/soe_validator.exe -Destination dist_pkg/
 
-          # README（逐行写，避免 here-string 导致 YAML 解析错误）
+          # README（逐行写，UTF-8）
           $readmeLines = @(
             '【使用说明】',
             '1) 将以下 3 个文件放到同一文件夹：',
             '   - soe_validator.exe',
             '   - 校验.bat',
-            '   - 你的 Excel：待校验数据.xlsx、数据标准2.0数据采集校验规则_V2.3.xlsx',
+            '   - 你的 Excel：待校验数据.xlsx、数据标准2.0数据采集校验规则_V2.5.xlsx',
             '2) 双击运行“校验.bat”，按提示修改文件名路径即可（中文/含空格请保留引号）',
             '',
             '【命令行示例】',
-            'soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.3.xlsx" --sheet "央企端-表内校验" --codes-sheet "码值" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "validation_errors_v23.xlsx"'
+            'soe_validator.exe --data "待校验数据.xlsx" --rules-xlsx "数据标准2.0数据采集校验规则_V2.5.xlsx" --output "validation_output.xlsx"'
           )
           $readmeLines | Set-Content -LiteralPath dist_pkg\README_使用说明.txt -Encoding UTF8
 
-          # 批处理（逐行写）
+          # 批处理（逐行写，UTF-8）
           $batLines = @(
             '@echo off',
             'chcp 65001 >nul',
             'set EXE=soe_validator.exe',
             'set DATA=待校验数据.xlsx',
-            'set RULES=数据标准2.0数据采集校验规则_V2.3.xlsx',
-            'set SHEET=央企端-表内校验',
-            'set CODES=码值',
-            'set OUT=validation_errors_v23.xlsx',
+            'set RULES=数据标准2.0数据采集校验规则_V2.5.xlsx',
+            'set OUT=validation_output.xlsx',
             '',
             'echo ==== 自检文件 ====',
-            'if not exist "%EXE%" echo 未找到 %EXE% & pause & exit /b 2',
+            'if not exist "%EXE%"  echo 未找到 %EXE% & pause & exit /b 2',
             'if not exist "%DATA%" echo 未找到 %DATA%（按需改名） & pause & exit /b 2',
             'if not exist "%RULES%" echo 未找到 %RULES%（按需改名） & pause & exit /b 2',
             '',
             'echo ==== 开始校验 ====',
-            '"%EXE%" --data "%DATA%" --rules-xlsx "%RULES%" --sheet "%SHEET%" --codes-sheet "%CODES%" --pk "中央企业职工收入情况表:统一社会信用代码,证件号码,姓名" --output "%OUT%"',
+            '"%EXE%" --data "%DATA%" --rules-xlsx "%RULES%" --output "%OUT%"',
             'if %errorlevel% neq 0 (',
             '  echo 运行失败(错误码: %errorlevel%)',
             '  pause',
