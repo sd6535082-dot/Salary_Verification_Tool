@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-SOE Validator (All-in-One, fixed, 2025-10-30)
-修复点：
-1. _run_staff_income_checks 里 c_overseas 的写法由
-       c_overseas = col("其中：境外工作补贴") or col("境外工作补贴")
-   改成了显式判断，避免 pandas 的 "truth value of a Series is ambiguous".
-2. 其余结构与上版保持一致。
+SOE Validator (All-in-One, fixed, 2025-10-30, sep3)
+在 sep2 的基础上改动点：
+1. “中长期激励工具” 的取值不再被规则表里不完整的枚举误杀：
+   - 在字段级校验里，如果字段名是“中长期激励工具”，就用代码内置的字符集
+     （abcdefghijklmnopqrz 和 |），而不是规则表里的枚举。
+2. 中长期激励三件套的业务关系补全：
+   - 参与=是 & 工具为空 → 报错（原有）
+   - 参与=否 & 工具有值 → 报错（新增）
+   - 中长期激励收入>0 & 工具为空 → 报错（原有 sep2 已加）
+3. “其他一次性专项奖励、其他一次性专项奖励名称” 与
+   “中长期激励三件套” 保持完全独立，互不干扰（沿用 sep2 的拆分）。
 """
 
 import argparse
@@ -418,7 +423,7 @@ def _run_tb5_strict(df: pd.DataFrame, table: str, pk_of):
     _pair(s_dir_fee,  w1, i1, "TB5-003", "直接签订用工合同农民工费用总额", "其中：工资总额.1", "其中：各类保险总额.1")
     _pair(s_disp_fee, w2, i2, "TB5-004", "劳务派遣形式农民工费用总额",   "其中：工资总额.2", "其中：各类保险总额.2")
     _pair(s_outs_fee, w3, i3, "TB5-005", "劳务外包和业务外包农民工费用总额","其中：工资总额.3", "其中：各类保险总额.3")
-    _pair(s_other_fee,w4, i4, "TB5-006", "其他农民工费用总额",           "其中：工资总额.4", "其中：各类保险总额.4")
+    _pair(s_other_fee, w4, i4, "TB5-006", "其他农民工费用总额",           "其中：工资总额.4", "其中：各类保险总额.4")
 
     return msgs, rows
 
@@ -518,7 +523,11 @@ def _pick_first_col(df, names):
 
 def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
     """
-    职工收入专项（含“总收入≤0 → 备注必填”）
+    职工收入专项
+    分拆逻辑：
+    - “其他一次性专项奖励*” 这条只管自己；
+    - “是否参与中长期激励 / 中长期激励工具 / 中长期激励收入” 三件套自己一组；
+    - 总收入≤0 → 备注必填；
     """
     if not (("职工收入" in str(table)) or ("收入情况" in str(table))):
         return defaultdict(list), []
@@ -546,7 +555,6 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
     c_defer = col("延期支付兑现部分"); c_other_bonus = col("其他一次性专项奖励")
     c_other_bonus_name = col("其他一次性专项奖励名称")
 
-    # 修复这里的 Series 判断
     c_overseas = col("其中：境外工作补贴")
     if c_overseas is None:
         c_overseas = col("境外工作补贴")
@@ -560,12 +568,12 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
 
     c_long_flag = col("是否参与中长期激励")
     c_long_tools = col("中长期激励工具")
+    c_long_income = col("中长期激励收入")
 
     c_realpay = col("实发数")
     c_total_income = col("总收入")
     c_extra_benefit = col("工资总额外的福利费用")
 
-    # 发薪时间（允许“发薪时间”或“发薪日期”）
     c_paytime = col("发薪时间")
     if c_paytime is None:
         c_paytime = col("发薪日期")
@@ -574,7 +582,6 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
     c_on_job = col("是否在岗")
 
     c_is_sci = col("是否为科技人员")
-    # 兼容多种写法：实际数据里是“是否直接从事科技研发工作”
     c_is_rnd = _pick_first_col(df, [
         "是否直接从事研发工作",
         "是否直接从事科技研发工作",
@@ -582,16 +589,14 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
     ])
 
     c_org_pair = col("子企业单位名称（单位代码）")
-    remark_candidates = [
-        "备注","说明","备注/说明","备注说明","备注（说明）","备注(说明)","说明原因","原因"
-    ]
-    remark_cols = [c for c in remark_candidates if c in df.columns]
 
+    # 中长期激励工具允许字符（这里跟下面的字段级校验保持一致）
     allowed_long_tool = set("abcdefghijklmnopqrz|")
 
     for i in range(n):
         r = i+2; pk = pk_of(i)
 
+        # 1 税前工资性收入 = 各组成
         if c_tax_income is not None and all(x is not None for x in [c_basic,c_perf,c_allow,c_defer,c_other_bonus]):
             parts=[dec(c_basic.iloc[i]), dec(c_perf.iloc[i]), dec(c_allow.iloc[i]), dec(c_defer.iloc[i]), dec(c_other_bonus.iloc[i])]
             if not any(p is None for p in parts):
@@ -607,6 +612,7 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                         "允许值":"", "建议修复":""
                     })
 
+        # 2 境外工作补贴 <= 津补贴
         if c_overseas is not None and c_allow is not None:
             ov=dec(c_overseas.iloc[i]); al=dec(c_allow.iloc[i])
             if ov is not None and al is not None and ov>al:
@@ -619,8 +625,7 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                     "允许值":"", "建议修复":""
                 })
 
-
-        # 2.1 发薪时间格式严格校验
+        # 2.1 发薪时间格式
         if c_paytime is not None:
             _pt = str(c_paytime.iloc[i] or "").strip()
             if _pt != "":
@@ -640,6 +645,8 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                         "允许值": "例如：2025-09-08 19:27:56",
                         "建议修复": "确认发薪日期并按示例填写"
                     })
+
+        # 3 应扣合计 = 各扣款
         if c_deduct_total is not None and all(x is not None for x in deduct_cols):
             vals=[dec(x.iloc[i]) for x in deduct_cols]
             if not any(v is None for v in vals):
@@ -655,12 +662,11 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                         "允许值":"", "建议修复":""
                     })
 
-        # 4 其他一次性专项奖励相关校验
+        # 4 其他一次性专项奖励 —— 独立
         if c_other_bonus is not None and c_other_bonus_name is not None:
             amt = dec(c_other_bonus.iloc[i])
             raw_name = c_other_bonus_name.iloc[i]
             name = "" if _is_empty_like(raw_name) else str(raw_name).strip()
-            # 4.1 金额>0 ⇒ 名称必填
             if amt is not None and amt > 0 and name == "":
                 flds = ("其他一次性专项奖励","其他一次性专项奖励名称")
                 msg = "其他一次性专项奖励>0时必须填写名称。"
@@ -671,7 +677,6 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                     "原始值": f"{c_other_bonus.iloc[i]} | {raw_name}",
                     "允许值": "", "建议修复": ""
                 })
-            # 4.2 金额=0 ⇒ 名称可以为空（只有金额=0且名称真有字才警告）
             if (amt is None or amt == 0) and name != "":
                 flds = ("其他一次性专项奖励","其他一次性专项奖励名称")
                 msg = "其他一次性专项奖励=0时，名称应为空。"
@@ -682,41 +687,56 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                     "原始值": f"{c_other_bonus.iloc[i]} | {raw_name}",
                     "允许值": "", "建议修复": ""
                 })
-            # 4.3 新增：有“其他一次性专项奖励”金额 ⇒ 必须填写中长期激励工具
-            if amt is not None and amt > 0:
-                # 统一取中长期激励工具
-                long_tools_val = ""
-                for cand in ("中长期激励工具", "中长期激励"):
-                    if cand in df.columns:
-                        tmp = df[cand].iloc[i]
-                        if not _is_empty_like(tmp):
-                            long_tools_val = str(tmp).strip()
-                            break
-                if long_tools_val == "":
-                    flds = ("其他一次性专项奖励","中长期激励工具")
-                    msg = "其他一次性专项奖励>0时，中长期激励工具需要填写内容。"
-                    msgs[r].append(f"[职收-004-ERROR] [{' | '.join(flds)}] {msg}")
-                    rows.append({
-                        "表名": table, "行号": r, "主键": pk, "字段": " | ".join(flds),
-                        "错误类型": "职收-004-ERROR", "错误信息": msg,
-                        "原始值": f"{c_other_bonus.iloc[i]} | ",
-                        "允许值": "请填写对应的中长期激励工具，如 a|b|g", "建议修复": ""
-                    })
+            # 不再去碰中长期激励工具
 
+        # 5 中长期激励 —— 独立一组
+        # 5.1 参与=是 → 工具必填
+        fl_val = None
         if c_long_flag is not None:
-            fl=str(c_long_flag.iloc[i] or "").strip()
-            if fl in ("是","1","true","True","Y","y") or fl.startswith("1-"):
-                tools="" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
-                if tools=="":
+            fl_val = str(c_long_flag.iloc[i] or "").strip()
+            tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
+            yes_like = ("是","1","true","True","Y","y")
+            no_like  = ("否","0","false","False","N","n","2-否")
+            if fl_val in yes_like or (fl_val and fl_val.startswith("1-")):
+                if tools_val == "":
                     flds=("是否参与中长期激励","中长期激励工具"); msg="已参与中长期激励但未填写中长期激励工具。"
                     msgs[r].append(f"[职收-005-ERROR] [{' | '.join(flds)}] {msg}")
                     rows.append({
                         "表名":table,"行号":r,"主键":pk,"字段":" | ".join(flds),
                         "错误类型":"职收-005-ERROR","错误信息":msg,
-                        "原始值":f"{fl} | {tools}",
+                        "原始值":f"{fl_val} | {tools_val}",
+                        "允许值":"", "建议修复":""
+                    })
+            # 5.2 参与=否 → 工具必须为空（这是你要的新增）
+            if fl_val in no_like:
+                tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
+                if tools_val != "":
+                    flds=("是否参与中长期激励","中长期激励工具"); msg="未参与中长期激励但填写了中长期激励工具，请清空。"
+                    msgs[r].append(f"[职收-005B-ERROR] [{' | '.join(flds)}] {msg}")
+                    rows.append({
+                        "表名":table,"行号":r,"主键":pk,"字段":" | ".join(flds),
+                        "错误类型":"职收-005B-ERROR","错误信息":msg,
+                        "原始值":f"{fl_val} | {tools_val}",
                         "允许值":"", "建议修复":""
                     })
 
+        # 5.3 中长期激励收入>0 → 工具也要填
+        if c_long_income is not None:
+            inc_val = dec(c_long_income.iloc[i])
+            if inc_val is not None and inc_val > 0:
+                tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
+                if tools_val == "":
+                    flds=("中长期激励收入","中长期激励工具")
+                    msg="中长期激励收入>0时，中长期激励工具必须填写。"
+                    msgs[r].append(f"[职收-005A-ERROR] [{' | '.join(flds)}] {msg}")
+                    rows.append({
+                        "表名":table,"行号":r,"主键":pk,"字段":" | ".join(flds),
+                        "错误类型":"职收-005A-ERROR","错误信息":msg,
+                        "原始值":f"{c_long_income.iloc[i]} | ",
+                        "允许值":"填写实际使用的中长期激励工具编码，如 a|b|g", "建议修复":""
+                    })
+
+        # 6 实发数
         if c_realpay is not None and c_total_income is not None and c_deduct_total is not None:
             inc=dec(c_total_income.iloc[i])
             ben=dec(c_extra_benefit.iloc[i]) if c_extra_benefit is not None else None
@@ -735,6 +755,7 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                         "允许值":"", "建议修复":""
                     })
 
+        # 7 岗位层级=91-其他 → 是否在岗为否类
         if c_post_level is not None and c_on_job is not None:
             lv=str(c_post_level.iloc[i] or "").strip(); on=str(c_on_job.iloc[i] or "").strip()
             if lv.startswith("91") and not any(on.startswith(x) for x in ("2","3","4","5")):
@@ -747,6 +768,7 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                     "允许值":"", "建议修复":""
                 })
 
+        # 8 科技人员一致性
         if c_is_sci is not None and c_is_rnd is not None:
             sci=str(c_is_sci.iloc[i] or "").strip()
             rnd=str(c_is_rnd.iloc[i] or "").strip()
@@ -760,8 +782,20 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                     "允许值":"", "建议修复":""
                 })
 
+        # 9 子企业单位名称（单位代码）
+        if c_org_pair is not None:
+            val=str(c_org_pair.iloc[i] or "").strip()
+            if val == "":
+                flds = ("子企业单位名称（单位代码）",)
+                msg = "子企业单位名称（单位代码）不得为空，请按组织基础库信息准确填写。"
+                msgs[r].append(f"[职收-009-ERROR] [{flds[0]}] {msg}")
+                rows.append({
+                    "表名":table,"行号":r,"主键":pk,"字段":flds[0],
+                    "错误类型":"职收-009-ERROR","错误信息":msg,
+                    "原始值":"", "允许值":"", "建议修复":""
+                })
 
-        # 10 总收入为0或为负数 ⇒ 备注/说明 必填（NaN/None/'nan' 都视为未填）
+        # 10 总收入≤0 → 备注必填
         if c_total_income is not None:
             _inc = dec(c_total_income.iloc[i])
             if _inc is not None and _inc <= 0:
@@ -791,18 +825,8 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                         "允许值": "请填写如：停薪留职、当期无实发、长期病假、年度一次性计提等原因",
                         "建议修复": "在备注或说明列中补充0或负数的具体原因"
                     })
-        if c_org_pair is not None:
-            val=str(c_org_pair.iloc[i] or "").strip()
-            if val == "":
-                flds = ("子企业单位名称（单位代码）",)
-                msg = "子企业单位名称（单位代码）不得为空，请按组织基础库信息准确填写。"
-                msgs[r].append(f"[职收-009-ERROR] [{flds[0]}] {msg}")
-                rows.append({
-                    "表名":table,"行号":r,"主键":pk,"字段":flds[0],
-                    "错误类型":"职收-009-ERROR","错误信息":msg,
-                    "原始值":"", "允许值":"", "建议修复":""
-                })
 
+        # 11 中长期激励工具格式
         if c_long_tools is not None:
             val=str(c_long_tools.iloc[i] or "").strip()
             if val != "":
@@ -948,13 +972,13 @@ def cross_check_fk_pairs(dfs: Dict[str, pd.DataFrame], writer) -> None:
                     rows.append({
                         KEY_CODE:c, KEY_NAME:n, SUP_CODE:sc, SUP_NAME:sn,
                         "行号":idx+2, "问题描述":"引用缺失（子企业代码+名称必须同时填写）",
-                        "期望上级(代码)":"", "期望上级(名称)":""
+                        "期望上级(代码)":"", "期望上级(名称)":" "
                     })
                 elif (c,n) not in master_pairs:
                     rows.append({
                         KEY_CODE:c, KEY_NAME:n, SUP_CODE:sc, SUP_NAME:sn,
                         "行号":idx+2, "问题描述":"不在主数据（子企业代码+名称）集合中",
-                        "期望上级(代码)":"", "期望上级(名称)":""
+                        "期望上级(代码)":"", "期望上级(名称)":" "
                     })
             if has_super and c and n and (sc or sn):
                 exp = master_super.get((c,n))
@@ -970,7 +994,7 @@ def cross_check_fk_pairs(dfs: Dict[str, pd.DataFrame], writer) -> None:
                     rows.append({
                         KEY_CODE:c, KEY_NAME:n, SUP_CODE:sc, SUP_NAME:sn,
                         "行号":idx+2, "问题描述":"主表未提供该单位的上级信息，仅提示",
-                        "期望上级(代码)":"", "期望上级(名称)":""
+                        "期望上级(代码)":"", "期望上级(名称)":" "
                     })
 
         sheet = f"表间-主键&上级-{t}"[:31]
@@ -1109,7 +1133,23 @@ def validate_dataframe(df: pd.DataFrame,
                     row_msgs.append(f"[{field}] 取值不在枚举中")
 
             enum_set: Set[str] = set(rules.get(field, {}).get("enum") or fr.get("enum") or [])
-            if field == "上市类型":
+            # ★这里加了一个特判：中长期激励工具我们不用规则表的枚举
+            if field == "中长期激励工具":
+                # 只要是 a~q / r / z / | 组成就过；具体格式检查在表内逻辑已经做了
+                ok = all(ch in "abcdefghijklmnopqrz|" for ch in sval)
+                if not ok:
+                    errors.append({
+                        "表名": table,
+                        "行号": idx + 2,
+                        "主键": pk_of(idx),
+                        "字段": field,
+                        "错误类型": "取值非法",
+                        "错误信息": "中长期激励工具格式不正确，应由abcdefghijklmnopqrz及符号|组成",
+                        "原始值": sval,
+                        "允许值": "如 a 或 a|b|g"
+                    })
+                    row_msgs.append(f"[{field}] 中长期激励工具格式不正确")
+            elif field == "上市类型":
                 msg_lt = check_listing_type(sval)
                 if msg_lt:
                     errors.append({
