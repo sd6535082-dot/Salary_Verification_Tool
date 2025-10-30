@@ -689,36 +689,82 @@ def _run_staff_income_checks(df: pd.DataFrame, table: str, pk_of):
                 })
             # 不再去碰中长期激励工具
 
-        # 5 中长期激励 —— 独立一组
+        # 5 中长期激励 —— 独立逻辑
+        long_flag_val = None if c_long_flag is None else c_long_flag.iloc[i]
+        long_tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
+        long_inc_val = None if c_long_income is not None else None
+        if c_long_income is not None:
+            # 原来你的写法里是 dec(...)，这里还是按原来的方式取
+            long_inc_val = dec(c_long_income.iloc[i])
+
         # 5.1 参与=是 → 工具必填
-        fl_val = None
-        if c_long_flag is not None:
-            fl_val = str(c_long_flag.iloc[i] or "").strip()
-            tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
-            yes_like = ("是","1","true","True","Y","y")
-            no_like  = ("否","0","false","False","N","n","2-否")
-            if fl_val in yes_like or (fl_val and fl_val.startswith("1-")):
-                if tools_val == "":
-                    flds=("是否参与中长期激励","中长期激励工具"); msg="已参与中长期激励但未填写中长期激励工具。"
-                    msgs[r].append(f"[职收-005-ERROR] [{' | '.join(flds)}] {msg}")
-                    rows.append({
-                        "表名":table,"行号":r,"主键":pk,"字段":" | ".join(flds),
-                        "错误类型":"职收-005-ERROR","错误信息":msg,
-                        "原始值":f"{fl_val} | {tools_val}",
-                        "允许值":"", "建议修复":""
-                    })
-            # 5.2 参与=否 → 工具必须为空（这是你要的新增）
-            if fl_val in no_like:
-                tools_val = "" if c_long_tools is None else str(c_long_tools.iloc[i] or "").strip()
-                if tools_val != "":
-                    flds=("是否参与中长期激励","中长期激励工具"); msg="未参与中长期激励但填写了中长期激励工具，请清空。"
-                    msgs[r].append(f"[职收-005B-ERROR] [{' | '.join(flds)}] {msg}")
-                    rows.append({
-                        "表名":table,"行号":r,"主键":pk,"字段":" | ".join(flds),
-                        "错误类型":"职收-005B-ERROR","错误信息":msg,
-                        "原始值":f"{fl_val} | {tools_val}",
-                        "允许值":"", "建议修复":""
-                    })
+        def _is_true_like(v):
+            if v is None:
+                return False
+            s = str(v).strip()
+            if s in ("是", "1", "1-是"):
+                return True
+            return s.lower() in ("true", "y", "yes")
+
+        def _is_false_like(v):
+            if v is None:
+                return False
+            s = str(v).strip()
+            if s in ("否", "0", "2-否"):
+                return True
+            return s.lower() in ("false", "n", "no")
+
+        def _is_empty_like2(v):
+            if v is None:
+                return True
+            s = str(v).strip()
+            if s == "":
+                return True
+            # 下面这些都当成“没填”
+            if s.lower() in ("nan", "none", "null", "na"):
+                return True
+            if s in ("无", "0", "0-否"):
+                return True
+            return False
+
+        # 参与 = 是
+        if _is_true_like(long_flag_val):
+            if _is_empty_like2(long_tools_val):
+                flds = ("是否参与中长期激励", "中长期激励工具")
+                msg = "已参与中长期激励但未填写中长期激励工具。"
+                msgs[r].append(f"[职收-005-ERROR] [{' | '.join(flds)}] {msg}")
+                rows.append({
+                    "表名": table, "行号": r, "主键": pk, "字段": " | ".join(flds),
+                    "错误类型": "职收-005-ERROR", "错误信息": msg,
+                    "原始值": f"{long_flag_val} | {long_tools_val}",
+                    "允许值": "", "建议修复": ""
+                })
+
+        # 不参与 = 否 → 只有真写了东西才报
+        elif _is_false_like(long_flag_val):
+            if not _is_empty_like2(long_tools_val):
+                flds = ("是否参与中长期激励", "中长期激励工具")
+                msg = "未参与中长期激励但填写了中长期激励工具，请清空。"
+                msgs[r].append(f"[职收-005B-ERROR] [{' | '.join(flds)}] {msg}")
+                rows.append({
+                    "表名": table, "行号": r, "主键": pk, "字段": " | ".join(flds),
+                    "错误类型": "职收-005B-ERROR", "错误信息": msg,
+                    "原始值": f"{long_flag_val} | {long_tools_val}",
+                    "允许值": "为空", "建议修复": "清空“中长期激励工具”"
+                })
+
+        # 5.2 中长期激励收入>0 → 工具必填（这个逻辑还是保留的）
+        if long_inc_val is not None and long_inc_val > 0:
+            if _is_empty_like2(long_tools_val):
+                flds = ("中长期激励收入", "中长期激励工具")
+                msg = "中长期激励收入>0时，中长期激励工具必须填写。"
+                msgs[r].append(f"[职收-005A-ERROR] [{' | '.join(flds)}] {msg}")
+                rows.append({
+                    "表名": table, "行号": r, "主键": pk, "字段": " | ".join(flds),
+                    "错误类型": "职收-005A-ERROR", "错误信息": msg,
+                    "原始值": f"{long_inc_val} | ",
+                    "允许值": "填写实际使用的中长期激励工具编码，如 a|b|g", "建议修复": ""
+                })
 
         # 5.3 中长期激励收入>0 → 工具也要填
         if c_long_income is not None:
